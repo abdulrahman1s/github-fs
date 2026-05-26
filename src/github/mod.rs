@@ -105,9 +105,7 @@ impl RepoFilter {
         let visibility = self.visibility;
         match &self.owners {
             Owners::SelfOnly | Owners::All => {
-                repos.retain(|r| {
-                    (include_forks || !r.fork) && visibility.allows(r.private)
-                });
+                repos.retain(|r| (include_forks || !r.fork) && visibility.allows(r.private));
             }
             Owners::List(list) => {
                 repos.retain(|r| {

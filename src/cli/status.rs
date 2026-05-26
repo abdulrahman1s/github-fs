@@ -16,28 +16,23 @@ pub struct GhfsMount {
 /// length descending so prefix-matching callers can pick the most specific
 /// mount first. Shared with `ghfs promote` for resolving FUSE-path args.
 pub fn list_ghfs_mounts() -> Result<Vec<GhfsMount>> {
-    let raw = std::fs::read_to_string(PROC_MOUNTS)
-        .with_context(|| format!("reading {PROC_MOUNTS}"))?;
+    let raw =
+        std::fs::read_to_string(PROC_MOUNTS).with_context(|| format!("reading {PROC_MOUNTS}"))?;
     let mut mounts = parse_proc_mounts(&raw);
     mounts.sort_by_key(|m| std::cmp::Reverse(m.mountpoint.as_os_str().len()));
     Ok(mounts)
 }
 
 pub fn run() -> Result<()> {
-    let raw = std::fs::read_to_string(PROC_MOUNTS)
-        .with_context(|| format!("reading {PROC_MOUNTS}"))?;
+    let raw =
+        std::fs::read_to_string(PROC_MOUNTS).with_context(|| format!("reading {PROC_MOUNTS}"))?;
     let mounts = parse_proc_mounts(&raw);
     if mounts.is_empty() {
         println!("no ghfs mounts found");
         return Ok(());
     }
     for m in &mounts {
-        println!(
-            "{}\t({}, {})",
-            m.mountpoint.display(),
-            m.fstype,
-            m.options
-        );
+        println!("{}\t({}, {})", m.mountpoint.display(), m.fstype, m.options);
     }
     Ok(())
 }

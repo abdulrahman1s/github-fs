@@ -674,7 +674,11 @@ mod tests {
 
         assert_eq!(
             target,
-            store_dir.path().join("acme").join("widgets").join("feature%2Fx")
+            store_dir
+                .path()
+                .join("acme")
+                .join("widgets")
+                .join("feature%2Fx")
         );
         assert!(target.is_dir());
     }

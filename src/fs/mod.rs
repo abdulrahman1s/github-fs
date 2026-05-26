@@ -266,7 +266,12 @@ impl Ghfs {
         let metadata = match std::fs::symlink_metadata(&child_disk) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(GhfsError::Logic(format!("stat {}: {e}", child_disk.display()))),
+            Err(e) => {
+                return Err(GhfsError::Logic(format!(
+                    "stat {}: {e}",
+                    child_disk.display()
+                )));
+            }
         };
         Ok(Some(self.passthrough_allocate(
             parent_ino, name, repo, branch, parent_rel, &metadata,
@@ -278,10 +283,7 @@ impl Ghfs {
     /// inodes for any new children created under it. `None` means this
     /// inode does not sit under a materialized worktree, which is the
     /// signal write ops use to short-circuit with `EROFS`.
-    fn passthrough_ctx(
-        &self,
-        ino: u64,
-    ) -> Option<(std::path::PathBuf, RepoRef, String, String)> {
+    fn passthrough_ctx(&self, ino: u64) -> Option<(std::path::PathBuf, RepoRef, String, String)> {
         let kind = self.inodes.get(ino)?;
         let (repo, branch, rel) = self.branch_relative_path(&kind)?;
         let repo = repo.clone();
@@ -303,9 +305,8 @@ impl Ghfs {
         parent_rel: &str,
         parent_disk: &std::path::Path,
     ) -> Result<Vec<DirChild>, GhfsError> {
-        let read_dir = std::fs::read_dir(parent_disk).map_err(|e| {
-            GhfsError::Logic(format!("read_dir {}: {e}", parent_disk.display()))
-        })?;
+        let read_dir = std::fs::read_dir(parent_disk)
+            .map_err(|e| GhfsError::Logic(format!("read_dir {}: {e}", parent_disk.display())))?;
         let mut out = Vec::new();
         for entry in read_dir {
             let entry = entry.map_err(|e| {
@@ -458,13 +459,8 @@ impl Ghfs {
             // Phase 2: fan out tree fetches for each repo's effective
             // branch. Cap concurrency so a 500-repo account doesn't open
             // 500 sockets.
-            prefetch_default_trees(
-                client,
-                meta,
-                Arc::clone(&tree_cache),
-                Arc::clone(&snapshot),
-            )
-            .await;
+            prefetch_default_trees(client, meta, Arc::clone(&tree_cache), Arc::clone(&snapshot))
+                .await;
             info!("background prefetch: trees done");
         });
     }
@@ -865,9 +861,7 @@ impl Ghfs {
                 }
                 let owner_login = name.to_string();
                 Ok(Some(self.inodes.lookup_or_create(parent_ino, name, || {
-                    InodeKind::Owner {
-                        login: owner_login,
-                    }
+                    InodeKind::Owner { login: owner_login }
                 })))
             }
             InodeKind::Owner { login } => {
@@ -915,9 +909,8 @@ impl Ghfs {
                     // Materialized worktree: passthrough. `.git` is real
                     // here, so skip the virtual-mode probe rejection that
                     // would otherwise hide it from `git status`.
-                    return self.passthrough_lookup_child(
-                        parent_ino, name, repo, branch, "", &wt_root,
-                    );
+                    return self
+                        .passthrough_lookup_child(parent_ino, name, repo, branch, "", &wt_root);
                 }
                 if is_local_git_metadata_probe(name) {
                     let path = self.path_for_child(parent, name);
@@ -998,11 +991,10 @@ impl Ghfs {
                         let name = login.to_string();
                         let login_for_make = name.clone();
                         let (ino, kind) =
-                            self.inodes.lookup_or_create(parent_ino, &name, || {
-                                InodeKind::Owner {
+                            self.inodes
+                                .lookup_or_create(parent_ino, &name, || InodeKind::Owner {
                                     login: login_for_make,
-                                }
-                            });
+                                });
                         DirChild { ino, kind, name }
                     })
                     .collect())
@@ -1022,14 +1014,12 @@ impl Ghfs {
                             self.effective_branch_for(rref.repo_id, r.default_branch.as_deref());
                         let rref_for_make = rref.clone();
                         let branch_for_make = branch.clone();
-                        let (ino, kind) = self.inodes.lookup_or_create(
-                            parent_ino,
-                            &name,
-                            || InodeKind::Repo {
-                                repo: rref_for_make,
-                                branch: branch_for_make,
-                            },
-                        );
+                        let (ino, kind) =
+                            self.inodes
+                                .lookup_or_create(parent_ino, &name, || InodeKind::Repo {
+                                    repo: rref_for_make,
+                                    branch: branch_for_make,
+                                });
                         DirChild { ino, kind, name }
                     })
                     .collect())
@@ -1039,9 +1029,8 @@ impl Ghfs {
                     return Ok(Vec::new());
                 }
                 if let Some(wt_root) = self.worktree_root_for(repo, branch) {
-                    return self.passthrough_collect_children(
-                        parent_ino, repo, branch, "", &wt_root,
-                    );
+                    return self
+                        .passthrough_collect_children(parent_ino, repo, branch, "", &wt_root);
                 }
                 let tree = self.get_repo_tree_index(repo, branch)?;
                 let sha = tree.sha();
@@ -1453,12 +1442,7 @@ impl RepoSnapshot {
     fn new(repos: Vec<Repo>) -> Self {
         let by_owner_name = repos
             .iter()
-            .map(|repo| {
-                (
-                    (repo.owner.login.clone(), repo.name.clone()),
-                    repo.clone(),
-                )
-            })
+            .map(|repo| ((repo.owner.login.clone(), repo.name.clone()), repo.clone()))
             .collect();
         let mut owners = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1488,9 +1472,7 @@ impl RepoSnapshot {
     }
 
     fn repos_for_owner<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = &'a Repo> {
-        self.repos
-            .iter()
-            .filter(move |r| r.owner.login == owner)
+        self.repos.iter().filter(move |r| r.owner.login == owner)
     }
 
     fn iter(&self) -> impl Iterator<Item = &Repo> {
@@ -2294,8 +2276,7 @@ impl Filesystem for Ghfs {
             reply.error(libc::ENOENT);
             return;
         };
-        let want_mutation =
-            mode.is_some() || size.is_some() || atime.is_some() || mtime.is_some();
+        let want_mutation = mode.is_some() || size.is_some() || atime.is_some() || mtime.is_some();
         if !want_mutation {
             // Pure stat. The kernel can issue setattr with no fields set
             // as a getattr-equivalent; return current attrs.
@@ -2694,8 +2675,10 @@ mod tests {
         assert!(snapshot.has_owner("me"));
         assert!(!snapshot.has_owner("someone-else"));
 
-        let me_repos: Vec<&str> =
-            snapshot.repos_for_owner("me").map(|r| r.name.as_str()).collect();
+        let me_repos: Vec<&str> = snapshot
+            .repos_for_owner("me")
+            .map(|r| r.name.as_str())
+            .collect();
         assert_eq!(me_repos, vec!["beta", "alpha"]);
     }
 
@@ -2835,7 +2818,9 @@ mod passthrough_tests {
     /// GitHub connectivity. Passthrough ops never touch the HTTP client,
     /// so pointing the client at `http://invalid` is fine.
     fn build_fs(temp: &std::path::Path) -> (Ghfs, tokio::runtime::Runtime) {
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let token = Token::new("ignored");
         let client = Arc::new(
             GithubClient::with_base(token.clone(), "http://invalid.example".to_string())
@@ -2860,7 +2845,12 @@ mod passthrough_tests {
 
     /// Mirror what `CloneStore::ensure_worktree` would lay down on disk,
     /// without going through libgit2 (which would need a real remote).
-    fn make_fake_worktree(clone_root: &std::path::Path, owner: &str, repo: &str, fs_name: &str) -> std::path::PathBuf {
+    fn make_fake_worktree(
+        clone_root: &std::path::Path,
+        owner: &str,
+        repo: &str,
+        fs_name: &str,
+    ) -> std::path::PathBuf {
         let wt = clone_root.join(owner).join(repo).join(fs_name);
         std::fs::create_dir_all(&wt).unwrap();
         wt
@@ -2902,10 +2892,11 @@ mod passthrough_tests {
         // Allocate the repo inode pre-clone (simulating the user cd'ing
         // into the repo dir while the FS is in virtual mode).
         let (repo_ino_before, kind_before) =
-            fs.inodes.lookup_or_create(FUSE_ROOT_INO, "widgets", || InodeKind::Repo {
-                repo: repo.clone(),
-                branch: "main".into(),
-            });
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "widgets", || InodeKind::Repo {
+                    repo: repo.clone(),
+                    branch: "main".into(),
+                });
         assert!(matches!(*kind_before, InodeKind::Repo { .. }));
 
         // Worktree materializes.
@@ -2935,10 +2926,12 @@ mod passthrough_tests {
         std::fs::create_dir(wt.join("src")).unwrap();
         std::fs::write(wt.join("src").join("lib.rs"), b"fn main() {}").unwrap();
 
-        let (repo_ino, _) = fs.inodes.lookup_or_create(100, "widgets", || InodeKind::Repo {
-            repo: repo.clone(),
-            branch: "main".into(),
-        });
+        let (repo_ino, _) = fs
+            .inodes
+            .lookup_or_create(100, "widgets", || InodeKind::Repo {
+                repo: repo.clone(),
+                branch: "main".into(),
+            });
 
         let (file_ino, file_kind) = fs
             .passthrough_lookup_child(repo_ino, "hello.txt", &repo, "main", "", &wt)

@@ -66,7 +66,10 @@ async fn warmup_single_page_returns_repos_with_default_branch_heads() {
         .mount(&server)
         .await;
 
-    let warmup = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap();
+    let warmup = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap();
     assert_eq!(warmup.len(), 2);
 
     let alpha = &warmup[0];
@@ -136,7 +139,10 @@ async fn warmup_returns_all_branches_per_repo_in_one_call() {
         .mount(&server)
         .await;
 
-    let warmup = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap();
+    let warmup = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap();
     assert_eq!(warmup.len(), 1);
     let alpha = &warmup[0];
     assert!(alpha.branches_complete);
@@ -180,7 +186,10 @@ async fn warmup_marks_branches_incomplete_when_inner_pagination_overflows() {
         .mount(&server)
         .await;
 
-    let warmup = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap();
+    let warmup = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap();
     assert!(!warmup[0].branches_complete);
     assert_eq!(warmup[0].branches.len(), 1);
 }
@@ -219,10 +228,16 @@ async fn warmup_paginates_via_end_cursor() {
         .mount(&server)
         .await;
 
-    let warmup = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap();
+    let warmup = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap();
     let names: Vec<&str> = warmup.iter().map(|w| w.repo.name.as_str()).collect();
     assert_eq!(names, vec!["alpha", "beta"]);
-    assert_eq!(warmup[1].default_branch_head.as_ref().unwrap().tree_sha, "t2");
+    assert_eq!(
+        warmup[1].default_branch_head.as_ref().unwrap().tree_sha,
+        "t2"
+    );
 }
 
 #[tokio::test]
@@ -247,7 +262,10 @@ async fn warmup_filters_forks_client_side() {
         .mount(&server)
         .await;
 
-    let warmup = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap();
+    let warmup = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap();
     assert_eq!(warmup.len(), 1);
     assert_eq!(warmup[0].repo.name, "kept");
 }
@@ -264,7 +282,10 @@ async fn warmup_surfaces_graphql_errors_array_as_unexpected() {
         .mount(&server)
         .await;
 
-    let err = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap_err();
+    let err = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap_err();
     assert!(matches!(err, GithubError::Unexpected { status: 200, .. }));
 }
 
@@ -276,7 +297,10 @@ async fn warmup_unauthorized() {
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
-    let err = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap_err();
+    let err = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap_err();
     assert!(matches!(err, GithubError::Unauthorized));
 }
 
@@ -379,10 +403,7 @@ async fn warmup_list_filter_drops_owners_client_side() {
 
     // The default repo_node uses owner.login = "me". Allow only that owner.
     let filter = RepoFilter::new(Owners::List(vec!["ME".into()]), false);
-    let warmup = client(&server)
-        .warmup_user_repos(&filter)
-        .await
-        .unwrap();
+    let warmup = client(&server).warmup_user_repos(&filter).await.unwrap();
     assert_eq!(warmup.len(), 1);
     assert_eq!(warmup[0].repo.name, "kept");
 }
@@ -400,7 +421,10 @@ async fn warmup_rate_limited() {
         )
         .mount(&server)
         .await;
-    let err = client(&server).warmup_user_repos(&RepoFilter::default()).await.unwrap_err();
+    let err = client(&server)
+        .warmup_user_repos(&RepoFilter::default())
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         GithubError::RateLimited {

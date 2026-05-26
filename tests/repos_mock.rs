@@ -294,9 +294,7 @@ async fn list_user_repos_all_drops_affiliation_param_and_keeps_collab_repos() {
     let recv = server.received_requests().await.unwrap();
     let req = recv.iter().find(|r| r.url.path() == "/user/repos").unwrap();
     assert!(
-        req.url
-            .query_pairs()
-            .all(|(k, _)| k != "affiliation"),
+        req.url.query_pairs().all(|(k, _)| k != "affiliation"),
         "All filter must not send affiliation; got query {:?}",
         req.url.query()
     );

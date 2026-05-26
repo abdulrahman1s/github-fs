@@ -516,8 +516,7 @@ mod tests {
 
     #[test]
     fn owners_parses_list_from_toml() {
-        let cf: ConfigFile =
-            toml::from_str(r#"owners = ["abdulrahman", "rust-lang"]"#).unwrap();
+        let cf: ConfigFile = toml::from_str(r#"owners = ["abdulrahman", "rust-lang"]"#).unwrap();
         let cfg = resolve(cf, &HashMap::new(), true);
         assert_eq!(
             cfg.owners,
@@ -625,22 +624,46 @@ mod tests {
     #[test]
     fn clone_trigger_parses_from_toml() {
         for (raw, expected) in [
-            (r#"[clone]
-trigger = "never""#, CloneTrigger::Never),
-            (r#"[clone]
-trigger = "on_list""#, CloneTrigger::OnList),
-            (r#"[clone]
-trigger = "on_read""#, CloneTrigger::OnRead),
-            (r#"[clone]
-trigger = "on-list""#, CloneTrigger::OnList),
-            (r#"[clone]
-trigger = "disabled""#, CloneTrigger::Never),
-            (r#"[clone]
-trigger = "on_access""#, CloneTrigger::OnAccess),
-            (r#"[clone]
-trigger = "on-access""#, CloneTrigger::OnAccess),
-            (r#"[clone]
-trigger = "access""#, CloneTrigger::OnAccess),
+            (
+                r#"[clone]
+trigger = "never""#,
+                CloneTrigger::Never,
+            ),
+            (
+                r#"[clone]
+trigger = "on_list""#,
+                CloneTrigger::OnList,
+            ),
+            (
+                r#"[clone]
+trigger = "on_read""#,
+                CloneTrigger::OnRead,
+            ),
+            (
+                r#"[clone]
+trigger = "on-list""#,
+                CloneTrigger::OnList,
+            ),
+            (
+                r#"[clone]
+trigger = "disabled""#,
+                CloneTrigger::Never,
+            ),
+            (
+                r#"[clone]
+trigger = "on_access""#,
+                CloneTrigger::OnAccess,
+            ),
+            (
+                r#"[clone]
+trigger = "on-access""#,
+                CloneTrigger::OnAccess,
+            ),
+            (
+                r#"[clone]
+trigger = "access""#,
+                CloneTrigger::OnAccess,
+            ),
         ] {
             let cf: ConfigFile = toml::from_str(raw).unwrap();
             let cfg = resolve(cf, &HashMap::new(), true);

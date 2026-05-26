@@ -49,8 +49,8 @@ pub fn build_attr_from_metadata(ino: u64, m: &Metadata, uid: u32, gid: u32) -> F
     let size = m.len();
     let atime = m.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
     let mtime = m.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let ctime = SystemTime::UNIX_EPOCH
-        + std::time::Duration::new(m.ctime() as u64, m.ctime_nsec() as u32);
+    let ctime =
+        SystemTime::UNIX_EPOCH + std::time::Duration::new(m.ctime() as u64, m.ctime_nsec() as u32);
     FileAttr {
         ino,
         size,

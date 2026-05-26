@@ -98,15 +98,11 @@ fn end_to_end_mount_lists_repos_and_reads_a_file() {
     let mountpoint = tempfile::tempdir().expect("mount tempdir");
 
     let client = Arc::new(
-        GithubClient::with_base(Token::new("test"), server.uri())
-            .expect("GithubClient::with_base"),
+        GithubClient::with_base(Token::new("test"), server.uri()).expect("GithubClient::with_base"),
     );
-    let meta = Arc::new(
-        MetaCache::open(cache_dir.path().join("meta.db")).expect("MetaCache::open"),
-    );
-    let blobs = Arc::new(
-        BlobStore::open(cache_dir.path().join("blobs")).expect("BlobStore::open"),
-    );
+    let meta =
+        Arc::new(MetaCache::open(cache_dir.path().join("meta.db")).expect("MetaCache::open"));
+    let blobs = Arc::new(BlobStore::open(cache_dir.path().join("blobs")).expect("BlobStore::open"));
 
     let fs = Ghfs::new(
         rt.handle().clone(),
@@ -153,8 +149,7 @@ fn end_to_end_mount_lists_repos_and_reads_a_file() {
         "expected README.md in tree: {files:?}"
     );
 
-    let content =
-        std::fs::read(mountpoint.path().join("alpha/README.md")).expect("read README.md");
+    let content = std::fs::read(mountpoint.path().join("alpha/README.md")).expect("read README.md");
     assert_eq!(content, b"hello\n");
 
     drop(session);
@@ -169,4 +164,3 @@ fn read_dir_names(p: &std::path::Path) -> Vec<String> {
     names.sort();
     names
 }
-

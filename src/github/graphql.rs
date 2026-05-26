@@ -8,12 +8,14 @@
 //! + commit SHA + tree SHA).
 
 use reqwest::{StatusCode, header};
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::{API_VERSION, ACCEPT_JSON, GithubClient, GithubError, Owner, Repo, RepoFilter,
-            classify_forbidden, unexpected};
+use super::{
+    ACCEPT_JSON, API_VERSION, GithubClient, GithubError, Owner, Repo, RepoFilter,
+    classify_forbidden, unexpected,
+};
 use crate::config::Owners;
 
 /// Seed for a single (repo, branch) HEAD, sourced from GraphQL. The tree SHA
@@ -282,7 +284,9 @@ impl GithubClient {
         let mut cursor: Option<String> = None;
         let mut out: Vec<WarmupRepo> = Vec::new();
         loop {
-            let vars = WarmupVars { cursor: cursor.as_deref() };
+            let vars = WarmupVars {
+                cursor: cursor.as_deref(),
+            };
             let data: WarmupData = self.post_graphql(&query, &vars).await?;
             let connection = data.viewer.repositories;
             for node in connection.nodes {
@@ -304,14 +308,21 @@ impl GithubClient {
                 let owner_id = node.owner.database_id.unwrap_or(0);
                 let default_branch = node.default_branch_ref.as_ref().map(|r| r.name.clone());
                 let head = node.default_branch_ref.and_then(seed_from_ref);
-                let branches: Vec<BranchHeadSeed> =
-                    node.refs.nodes.into_iter().filter_map(seed_from_ref).collect();
+                let branches: Vec<BranchHeadSeed> = node
+                    .refs
+                    .nodes
+                    .into_iter()
+                    .filter_map(seed_from_ref)
+                    .collect();
                 let branches_complete = !node.refs.page_info.has_next_page;
                 let repo = Repo {
                     id: node.database_id,
                     name: node.name,
                     full_name: node.name_with_owner,
-                    owner: Owner { login: node.owner.login, id: owner_id },
+                    owner: Owner {
+                        login: node.owner.login,
+                        id: owner_id,
+                    },
                     private: node.is_private,
                     default_branch,
                     description: node.description,
@@ -347,14 +358,20 @@ impl GithubClient {
         let mut cursor: Option<String> = None;
         let mut out: Vec<BranchHeadSeed> = Vec::new();
         loop {
-            let vars = BranchesVars { owner, repo, cursor: cursor.as_deref() };
+            let vars = BranchesVars {
+                owner,
+                repo,
+                cursor: cursor.as_deref(),
+            };
             let data: BranchesData = self.post_graphql(BRANCHES_QUERY, &vars).await?;
             let Some(repository) = data.repository else {
                 return Err(GithubError::NotFound);
             };
             for node in repository.refs.nodes {
                 let Some(target) = node.target else { continue };
-                let (Some(oid), Some(tree)) = (target.oid, target.tree) else { continue };
+                let (Some(oid), Some(tree)) = (target.oid, target.tree) else {
+                    continue;
+                };
                 out.push(BranchHeadSeed {
                     branch: node.name,
                     commit_sha: oid,
@@ -382,7 +399,10 @@ impl GithubClient {
         let resp = self
             .http
             .post(&url)
-            .header(header::AUTHORIZATION, format!("Bearer {}", self.token.expose()))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", self.token.expose()),
+            )
             .header(header::ACCEPT, ACCEPT_JSON)
             .header("X-GitHub-Api-Version", API_VERSION)
             .json(&body)
@@ -405,7 +425,10 @@ impl GithubClient {
                         .map(|e| e.message.as_str())
                         .collect::<Vec<_>>()
                         .join("; ");
-                    return Err(GithubError::Unexpected { status: 200, body: joined });
+                    return Err(GithubError::Unexpected {
+                        status: 200,
+                        body: joined,
+                    });
                 }
                 parsed.data.ok_or_else(|| GithubError::Unexpected {
                     status: 200,

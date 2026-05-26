@@ -40,9 +40,12 @@ async fn refresh_overwrites_cache_with_fresh_repos_and_etag() {
     let meta = MetaCache::open_in_memory().unwrap();
     // Seed the cache with stale data so we can verify refresh replaces it.
     meta.put_repos(&[]).unwrap();
-    meta.put_etag(OWNED_USER_REPOS_ETAG_KEY, "\"stale\"").unwrap();
+    meta.put_etag(OWNED_USER_REPOS_ETAG_KEY, "\"stale\"")
+        .unwrap();
 
-    let count = refresh_repos(&client(&server), &meta, &RepoFilter::default()).await.unwrap();
+    let count = refresh_repos(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap();
     assert_eq!(count, 2);
 
     let repos = meta.get_repos().unwrap();
@@ -68,7 +71,9 @@ async fn refresh_does_not_send_if_none_match() {
         .await;
 
     let meta = MetaCache::open_in_memory().unwrap();
-    let _ = refresh_repos(&client(&server), &meta, &RepoFilter::default()).await.unwrap();
+    let _ = refresh_repos(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap();
 
     let recv = server.received_requests().await.unwrap();
     let req = recv
@@ -92,11 +97,17 @@ async fn refresh_surfaces_unauthorized_without_touching_cache() {
 
     let meta = MetaCache::open_in_memory().unwrap();
     meta.put_repos(&[]).unwrap();
-    meta.put_etag(OWNED_USER_REPOS_ETAG_KEY, "\"original\"").unwrap();
+    meta.put_etag(OWNED_USER_REPOS_ETAG_KEY, "\"original\"")
+        .unwrap();
 
-    let err = refresh_repos(&client(&server), &meta, &RepoFilter::default()).await.unwrap_err();
+    let err = refresh_repos(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.to_lowercase().contains("unauthorized") || msg.contains("401"), "got: {msg}");
+    assert!(
+        msg.to_lowercase().contains("unauthorized") || msg.contains("401"),
+        "got: {msg}"
+    );
 
     // Cache must be untouched on failure.
     let etag = meta.get_etag(OWNED_USER_REPOS_ETAG_KEY).unwrap();
@@ -115,7 +126,9 @@ async fn refresh_rejects_unconditional_304() {
         .await;
 
     let meta = MetaCache::open_in_memory().unwrap();
-    let err = refresh_repos(&client(&server), &meta, &RepoFilter::default()).await.unwrap_err();
+    let err = refresh_repos(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("304"), "got: {msg}");
 }
@@ -132,7 +145,9 @@ async fn refresh_succeeds_when_server_sends_no_etag_header() {
         .await;
 
     let meta = MetaCache::open_in_memory().unwrap();
-    let count = refresh_repos(&client(&server), &meta, &RepoFilter::default()).await.unwrap();
+    let count = refresh_repos(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     // No etag came back; cache should not have one written either.
@@ -152,6 +167,8 @@ async fn refresh_authorization_header_is_set() {
         .await;
 
     let meta = MetaCache::open_in_memory().unwrap();
-    let count = refresh_repos(&client(&server), &meta, &RepoFilter::default()).await.unwrap();
+    let count = refresh_repos(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap();
     assert_eq!(count, 0);
 }

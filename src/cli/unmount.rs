@@ -15,12 +15,9 @@ use tracing::info;
 /// the last `cwd`/open handle goes away. We don't default to lazy because
 /// it can mask real bugs (e.g. ghfs threads still holding the FS).
 pub fn run(path: PathBuf, lazy: bool) -> Result<()> {
-    let canonical = path.canonicalize().map_err(|e| {
-        anyhow!(
-            "cannot resolve mountpoint {}: {e}",
-            path.display()
-        )
-    })?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| anyhow!("cannot resolve mountpoint {}: {e}", path.display()))?;
 
     if !canonical.is_dir() {
         bail!("mountpoint is not a directory: {}", canonical.display());
@@ -48,10 +45,7 @@ pub fn run(path: PathBuf, lazy: bool) -> Result<()> {
         } else {
             format!(": {trimmed}")
         };
-        bail!(
-            "fusermount3 exited with status {}{detail}",
-            output.status,
-        );
+        bail!("fusermount3 exited with status {}{detail}", output.status,);
     }
     info!(mountpoint = %canonical.display(), "unmounted");
     println!("unmounted: {}", canonical.display());
@@ -97,7 +91,9 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_errors() {
-        assert!(!is_busy("fusermount3: entry for /mnt/x not found in /etc/mtab"));
+        assert!(!is_busy(
+            "fusermount3: entry for /mnt/x not found in /etc/mtab"
+        ));
         assert!(!is_busy(""));
     }
 }
