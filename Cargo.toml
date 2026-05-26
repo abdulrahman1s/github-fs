@@ -1,0 +1,39 @@
+[package]
+name = "ghfs-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Mount GitHub repositories as a FUSE filesystem on Linux"
+license = "MIT"
+
+[[bin]]
+name = "ghfs"
+path = "src/main.rs"
+
+[lib]
+name = "github_fs"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "fs", "signal"] }
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+directories = "5"
+bytes = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+fuser = { version = "0.15", features = ["abi-7-12"] }
+libc = "0.2"
+git2 = { version = "0.19", default-features = false, features = ["https"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"

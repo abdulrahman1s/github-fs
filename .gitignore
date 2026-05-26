@@ -1,0 +1,6 @@
+/target
+.direnv
+.claude
+.env
+.codex
+.vscode
