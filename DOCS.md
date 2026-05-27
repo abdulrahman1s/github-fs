@@ -373,6 +373,13 @@ git status
 git checkout dev   # any branch the remote has is already a local ref
 ```
 
+Progress is rendered on **stderr** so stdout stays a single path. On a
+TTY the line refreshes in place; with stderr redirected, one line is
+written per stage transition (and every ~2s during a long fetch). The
+on-access trigger emits the same progress to the mount log (`info`-level
+`clone: fetching` / `clone: checking out` events), throttled to roughly
+one line per second.
+
 Resolution rules:
 
 - **path** — the argument must be a path that canonicalizes inside an

@@ -9,6 +9,7 @@
 //! per repo, with every branch fetched into `refs/heads/*`. Whichever branch
 //! is requested first is checked out; the user can `git checkout` to switch.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,35 @@ const GITHUB_HTTPS_BASE: &str = "https://github.com";
 
 type RepoKey = (String, String);
 type RepoLocks = Mutex<HashMap<RepoKey, Arc<Mutex<()>>>>;
+
+/// Progress events emitted by [`CloneStore::ensure_clone`] during a fresh
+/// clone. Callers must throttle their own rendering — `Fetching` fires many
+/// times per second while libgit2 streams pack data.
+#[derive(Debug, Clone, Copy)]
+pub enum CloneProgress {
+    Fetching {
+        received_objects: usize,
+        total_objects: usize,
+        indexed_objects: usize,
+        received_bytes: usize,
+    },
+    CheckingOut {
+        completed: usize,
+        total: usize,
+    },
+    /// The clone is on disk and the requested branch is checked out.
+    Done,
+}
+
+/// Callback shape accepted by [`CloneStore::ensure_clone`]. Use
+/// `&mut no_progress()` (or `&mut |_| {}`) when you don't care.
+pub type ProgressFn<'a> = &'a mut dyn FnMut(CloneProgress);
+
+/// Convenience: a no-op progress sink for tests / callers that just want
+/// the side effect of cloning.
+pub fn no_progress() -> impl FnMut(CloneProgress) {
+    |_| {}
+}
 
 pub struct CloneStore {
     root: PathBuf,
@@ -105,6 +135,7 @@ impl CloneStore {
         initial_branch: &str,
         remote_base: &str,
         fetch_depth: Option<u32>,
+        progress: ProgressFn<'_>,
     ) -> Result<PathBuf, CacheError> {
         // Fast path: clone already on disk. Skip even the lock — the steady-
         // state case is "exists" and we want it to be essentially free.
@@ -127,25 +158,44 @@ impl CloneStore {
         let repo_handle = Repository::init(&target)?;
         let url = format!("{remote_base}/{owner}/{repo}.git");
         let token = self.token.clone();
-        let mut cbs = RemoteCallbacks::new();
-        cbs.credentials(move |_url, _username, _allowed| {
-            Cred::userpass_plaintext("x-access-token", token.expose())
-        });
-        let mut fo = FetchOptions::new();
-        fo.remote_callbacks(cbs);
-        if let Some(d) = fetch_depth {
-            // i32 cast is safe in practice — depth > i32::MAX would be
-            // pathological and libgit2 itself takes i32.
-            fo.depth(d as i32);
-        }
+        // RefCell so both libgit2 callbacks (transfer_progress here,
+        // checkout progress below) can mutably borrow the same FnMut without
+        // a Mutex. libgit2 invokes them serially on the same thread, so
+        // contention is impossible — but the borrow checker can't see that.
+        let progress = RefCell::new(progress);
 
-        // Anonymous remote so we don't persist a stale config we'd never
-        // touch again. The refspec mirrors `git clone --no-single-branch`:
-        // every server-side branch becomes a local branch under
-        // `refs/heads/*`, so a future `git checkout <any>` just works.
-        let mut remote = repo_handle.remote_anonymous(&url)?;
-        let all_refs = "+refs/heads/*:refs/heads/*";
-        remote.fetch(&[all_refs], Some(&mut fo), None)?;
+        {
+            let mut cbs = RemoteCallbacks::new();
+            cbs.credentials(move |_url, _username, _allowed| {
+                Cred::userpass_plaintext("x-access-token", token.expose())
+            });
+            cbs.transfer_progress(|p| {
+                if let Ok(mut cb) = progress.try_borrow_mut() {
+                    (*cb)(CloneProgress::Fetching {
+                        received_objects: p.received_objects(),
+                        total_objects: p.total_objects(),
+                        indexed_objects: p.indexed_objects(),
+                        received_bytes: p.received_bytes(),
+                    });
+                }
+                true
+            });
+            let mut fo = FetchOptions::new();
+            fo.remote_callbacks(cbs);
+            if let Some(d) = fetch_depth {
+                // i32 cast is safe in practice — depth > i32::MAX would be
+                // pathological and libgit2 itself takes i32.
+                fo.depth(d as i32);
+            }
+
+            // Anonymous remote so we don't persist a stale config we'd never
+            // touch again. The refspec mirrors `git clone --no-single-branch`:
+            // every server-side branch becomes a local branch under
+            // `refs/heads/*`, so a future `git checkout <any>` just works.
+            let mut remote = repo_handle.remote_anonymous(&url)?;
+            let all_refs = "+refs/heads/*:refs/heads/*";
+            remote.fetch(&[all_refs], Some(&mut fo), None)?;
+        }
 
         // Set HEAD to the requested branch and materialize its tree in the
         // working directory. `set_head` + `checkout_head` is the libgit2
@@ -154,7 +204,14 @@ impl CloneStore {
         repo_handle.set_head(&head_ref)?;
         let mut co = git2::build::CheckoutBuilder::new();
         co.force();
+        co.progress(|_path, completed, total| {
+            if let Ok(mut cb) = progress.try_borrow_mut() {
+                (*cb)(CloneProgress::CheckingOut { completed, total });
+            }
+        });
         repo_handle.checkout_head(Some(&mut co))?;
+
+        (*progress.borrow_mut())(CloneProgress::Done);
 
         Ok(target)
     }
@@ -338,7 +395,7 @@ mod tests {
 
         assert!(!store.has_clone("acme", "widgets"));
         let target = store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
 
         assert!(store.has_clone("acme", "widgets"));
@@ -369,7 +426,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
 
         // Both branches must be present locally after the single clone.
@@ -390,12 +447,12 @@ mod tests {
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
 
         let a = store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
         // Touch the working tree — the second call must not clobber it.
         std::fs::write(a.join("hello.txt"), b"user-edited").unwrap();
         let b = store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
         assert_eq!(a, b);
         assert_eq!(
@@ -422,7 +479,14 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         let target = store
-            .ensure_clone("acme", "widgets", "feature/x", &base, None)
+            .ensure_clone(
+                "acme",
+                "widgets",
+                "feature/x",
+                &base,
+                None,
+                &mut no_progress(),
+            )
             .unwrap();
 
         // The clone dir basename is still just `widgets` — no encoding of
@@ -440,7 +504,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
 
         let tree = store
@@ -469,7 +533,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
         let tree = store
             .build_recursive_tree("acme", "widgets", commit_oid)
@@ -491,7 +555,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
         let tree_sha = store
             .commit_tree_sha("acme", "widgets", commit_oid)
@@ -508,7 +572,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
         let tree_sha = store
             .commit_tree_sha("acme", "widgets", commit_oid)
@@ -535,7 +599,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
         let tip = store.branch_tip("acme", "widgets", "main").unwrap();
         assert_eq!(tip, commit_oid);
@@ -547,7 +611,7 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         let target = store
-            .ensure_clone("acme", "widgets", "main", &base, None)
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
             .unwrap();
 
         // Opening as a normal (non-bare) git repository must succeed; HEAD
@@ -596,7 +660,14 @@ mod tests {
         let store_dir = tempdir().unwrap();
         let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
         store
-            .ensure_clone("acme", "widgets", "main", &base, Some(1))
+            .ensure_clone(
+                "acme",
+                "widgets",
+                "main",
+                &base,
+                Some(1),
+                &mut no_progress(),
+            )
             .unwrap();
 
         // The shallow clone has the tip commit but not its parent.

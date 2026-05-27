@@ -1,8 +1,11 @@
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tracing::info;
 
+use crate::cache::clones::CloneProgress;
 use crate::cache::{CloneStore, MetaCache, default_remote_base};
 use crate::cli::status::list_ghfs_mounts;
 use crate::config::{Config, token::Token};
@@ -70,6 +73,7 @@ pub async fn run(
 
     let store =
         CloneStore::open(&clone_root, token).context("opening clone store under cache dir")?;
+    let mut renderer = CliProgress::new();
     let path = store
         .ensure_clone(
             &owner,
@@ -77,6 +81,7 @@ pub async fn run(
             &branch,
             &default_remote_base(),
             cfg.clone.fetch_depth,
+            &mut |p| renderer.on(p),
         )
         .context("materializing clone via libgit2")?;
 
@@ -189,4 +194,185 @@ pub(crate) fn resolve_token(cli: Option<String>, cfg: &Config) -> Option<Token> 
     cli.filter(|s| !s.is_empty())
         .map(Token::new)
         .or_else(|| cfg.token.clone())
+}
+
+/// Stderr-bound progress display for `ghfs promote`. On a TTY it draws an
+/// in-place line with `\r`; with stderr redirected it falls back to a one-
+/// line-per-transition log so piped output stays readable.
+///
+/// Stdout is intentionally left untouched — `ghfs promote` prints the clone
+/// path on stdout and that needs to stay scriptable (`$(ghfs promote ...)`).
+struct CliProgress {
+    is_tty: bool,
+    last_render: Option<Instant>,
+    stage: Stage,
+    rendered_anything: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Idle,
+    Fetching,
+    CheckingOut,
+}
+
+impl CliProgress {
+    fn new() -> Self {
+        Self {
+            is_tty: std::io::stderr().is_terminal(),
+            last_render: None,
+            stage: Stage::Idle,
+            rendered_anything: false,
+        }
+    }
+
+    fn on(&mut self, p: CloneProgress) {
+        match p {
+            CloneProgress::Fetching {
+                received_objects,
+                total_objects,
+                indexed_objects,
+                received_bytes,
+            } => {
+                let stage_changed = self.stage != Stage::Fetching;
+                self.stage = Stage::Fetching;
+                if !self.should_render(stage_changed) {
+                    return;
+                }
+                let line = format_fetching(
+                    received_objects,
+                    total_objects,
+                    indexed_objects,
+                    received_bytes,
+                );
+                self.write(&line);
+            }
+            CloneProgress::CheckingOut { completed, total } => {
+                let stage_changed = self.stage != Stage::CheckingOut;
+                if stage_changed && self.is_tty && self.rendered_anything {
+                    // Finish the fetch line before starting checkout so the
+                    // user sees the transition.
+                    let _ = writeln!(std::io::stderr());
+                }
+                self.stage = Stage::CheckingOut;
+                if !self.should_render(stage_changed) {
+                    return;
+                }
+                let line = format_checkout(completed, total);
+                self.write(&line);
+            }
+            CloneProgress::Done => {
+                if self.rendered_anything {
+                    // Newline to close the in-place line (or the last log
+                    // line) so the path printed on stdout starts cleanly.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "\rclone ready                                          "
+                    );
+                }
+            }
+        }
+    }
+
+    /// Throttle: ~10 fps on a TTY, one line per ~2s otherwise. Always render
+    /// on a stage transition so the user sees fetch→checkout immediately.
+    fn should_render(&mut self, stage_changed: bool) -> bool {
+        let interval = if self.is_tty {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(2)
+        };
+        let now = Instant::now();
+        let due = self
+            .last_render
+            .is_none_or(|t| now.duration_since(t) >= interval);
+        if stage_changed || due {
+            self.last_render = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn write(&mut self, line: &str) {
+        let mut err = std::io::stderr().lock();
+        if self.is_tty {
+            // Pad with spaces so a longer previous line is fully overwritten.
+            let _ = write!(err, "\r{line:<70}");
+            let _ = err.flush();
+        } else {
+            let _ = writeln!(err, "{line}");
+        }
+        self.rendered_anything = true;
+    }
+}
+
+fn format_fetching(
+    received_objects: usize,
+    total_objects: usize,
+    indexed_objects: usize,
+    received_bytes: usize,
+) -> String {
+    let bytes = humanize_bytes(received_bytes);
+    if total_objects > 0 {
+        let pct = (received_objects * 100) / total_objects.max(1);
+        format!(
+            "fetching: {received_objects}/{total_objects} objects ({pct}%), {indexed_objects} indexed, {bytes}"
+        )
+    } else {
+        // Server hasn't told us the total yet — show what we have.
+        format!("fetching: {received_objects} objects, {bytes}")
+    }
+}
+
+fn format_checkout(completed: usize, total: usize) -> String {
+    if total > 0 {
+        let pct = (completed * 100) / total.max(1);
+        format!("checking out: {completed}/{total} files ({pct}%)")
+    } else {
+        format!("checking out: {completed} files")
+    }
+}
+
+fn humanize_bytes(n: usize) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} {}", UNITS[0])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn humanize_bytes_picks_unit() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(512), "512 B");
+        assert_eq!(humanize_bytes(2048), "2.0 KiB");
+        assert_eq!(humanize_bytes(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    #[test]
+    fn format_fetching_handles_unknown_total() {
+        let s = format_fetching(10, 0, 0, 1024);
+        assert!(s.contains("10 objects"));
+        assert!(s.contains("1.0 KiB"));
+    }
+
+    #[test]
+    fn format_fetching_includes_percentage() {
+        let s = format_fetching(50, 100, 25, 0);
+        assert!(s.contains("50/100"));
+        assert!(s.contains("50%"));
+        assert!(s.contains("25 indexed"));
+    }
 }

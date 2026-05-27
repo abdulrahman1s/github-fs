@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use fuser::{
     FileAttr, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -18,6 +18,7 @@ use libc::c_int;
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
+use crate::cache::clones::CloneProgress;
 use crate::cache::{BlobStore, CloneStore, MetaCache};
 use crate::config::CloneTrigger;
 use crate::github::{
@@ -819,12 +820,14 @@ impl Ghfs {
             fetch_depth = ?self.clone_fetch_depth,
             "cloning repo"
         );
+        let mut reporter = LoggedCloneProgress::new(&repo.owner, &repo.name, branch);
         if let Err(e) = store.ensure_clone(
             &repo.owner,
             &repo.name,
             branch,
             &self.clone_remote_base,
             self.clone_fetch_depth,
+            &mut |p| reporter.on(p),
         ) {
             warn!(error = %e, repo = %repo.name, branch, "clone: ensure_clone failed; falling back to GitHub API");
             return;
@@ -1224,6 +1227,97 @@ struct TreeEntryParent<'a> {
 enum BranchTreeSha {
     Found(String),
     Missing,
+}
+
+/// Throttled tracing renderer for libgit2 clone progress, used by the
+/// on-demand (`on_access` / `on_list`) trigger. The mount log is the only
+/// place a user sees the in-progress state of a triggered clone — without
+/// this, a slow fetch looks like a hung FUSE op.
+///
+/// Progress events arrive at libgit2's pace (many per second); we throttle
+/// to one log line per ~1s plus mandatory lines on stage transitions so
+/// `fetching → checking out → ready` is always visible in `info` logs.
+struct LoggedCloneProgress {
+    owner: String,
+    repo: String,
+    branch: String,
+    last_log: Option<Instant>,
+    stage: u8,
+}
+
+impl LoggedCloneProgress {
+    const STAGE_NONE: u8 = 0;
+    const STAGE_FETCH: u8 = 1;
+    const STAGE_CHECKOUT: u8 = 2;
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new(owner: &str, repo: &str, branch: &str) -> Self {
+        Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            last_log: None,
+            stage: Self::STAGE_NONE,
+        }
+    }
+
+    fn on(&mut self, p: CloneProgress) {
+        match p {
+            CloneProgress::Fetching {
+                received_objects,
+                total_objects,
+                indexed_objects,
+                received_bytes,
+            } => {
+                let stage_changed = self.stage != Self::STAGE_FETCH;
+                self.stage = Self::STAGE_FETCH;
+                if !self.should_log(stage_changed) {
+                    return;
+                }
+                info!(
+                    owner = %self.owner,
+                    repo = %self.repo,
+                    branch = %self.branch,
+                    received_objects,
+                    total_objects,
+                    indexed_objects,
+                    received_bytes,
+                    "clone: fetching"
+                );
+            }
+            CloneProgress::CheckingOut { completed, total } => {
+                let stage_changed = self.stage != Self::STAGE_CHECKOUT;
+                self.stage = Self::STAGE_CHECKOUT;
+                if !self.should_log(stage_changed) {
+                    return;
+                }
+                info!(
+                    owner = %self.owner,
+                    repo = %self.repo,
+                    branch = %self.branch,
+                    completed,
+                    total,
+                    "clone: checking out"
+                );
+            }
+            // Final "ready" line is emitted by try_clone_repo so it appears
+            // after seed_branch_head_from_clone too.
+            CloneProgress::Done => {}
+        }
+    }
+
+    fn should_log(&mut self, stage_changed: bool) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last_log
+            .is_none_or(|t| now.duration_since(t) >= Self::INTERVAL);
+        if stage_changed || due {
+            self.last_log = Some(now);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Return the user's repos. Pinned to a snapshot: once the cache is
