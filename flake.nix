@@ -373,11 +373,17 @@
                 wants = [ "network-online.target" ];
                 wantedBy = [ "default.target" ];
 
-                # The mount needs fusermount3 in PATH for ExecStop and for
-                # fuser's own teardown calls.
+                # `fusermount3` must be the SUID wrapper at
+                # `/run/wrappers/bin/fusermount3` — the raw binary in
+                # `${pkgs.fuse3}` is *not* setuid and fails with
+                # `mount failed: Operation not permitted` when invoked
+                # from an unprivileged systemd user service. So we
+                # deliberately do NOT put `pkgs.fuse3` on the path
+                # (which would shadow the wrapper) and instead pin
+                # `/run/wrappers/bin` to the front.
                 path = [
+                  "/run/wrappers"
                   package
-                  pkgs.fuse3
                   pkgs.coreutils
                 ];
 
@@ -396,7 +402,7 @@
                     ])
                     ++ (map lib.escapeShellArg cfg.autoMount.extraArgs)
                   );
-                  ExecStop = "${pkgs.fuse3}/bin/fusermount3 -u ${lib.escapeShellArg cfg.autoMount.mountPath}";
+                  ExecStop = "/run/wrappers/bin/fusermount3 -u ${lib.escapeShellArg cfg.autoMount.mountPath}";
                   Restart = "on-failure";
                   RestartSec = toString cfg.autoMount.restartSec;
                   # SIGINT triggers ghfs's clean-unmount path; SIGTERM is the
