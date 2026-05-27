@@ -51,6 +51,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp"),
             log_level: None,
             cache_ttl_secs: 0,
+            auto_refresh_interval_secs: None,
             owners: crate::config::Owners::default(),
             include_forks: false,
             visibility: crate::config::Visibility::default(),

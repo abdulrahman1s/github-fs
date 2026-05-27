@@ -462,6 +462,20 @@ top-level "what repos does this user have" listing. Trees are immutable
 by SHA and never need invalidation; branch heads expire via ETag on the
 next access.
 
+After writing the on-disk cache, `refresh` also sends `SIGUSR1` to
+every running mount that shares this cache directory — each running
+mount listens for `SIGUSR1` and re-fetches the repo list in place, so
+the change is reflected in `~/ghfs/<owner>/` listings immediately,
+without a remount. Live mounts are discovered via pidfiles under
+`<cache>/mounts/`; stale pidfiles (process gone) are reaped here.
+
+Mounts also auto-refresh on a timer (see
+[`auto_refresh_interval_secs`](#config-file), default 5 minutes), so
+even without `ghfs refresh` you'll pick up new GitHub repos within
+roughly the configured interval. The two paths are complementary:
+`ghfs refresh` is the "I want it now" trigger; the timer is the
+background poll.
+
 ## Filesystem layout
 
 ```text
@@ -537,6 +551,11 @@ mount_path     = "/home/you/ghfs"      # default mountpoint for `ghfs mount`
 cache_dir      = "/home/you/.cache/ghfs"
 cache_ttl_secs = 300                   # for resources that don't carry ETags
 log_level      = "ghfs=info"
+
+# Background repo-list refresh interval (seconds). Default 300 (5 min);
+# set to 0 to disable. The mount sends a conditional `If-None-Match`
+# every tick, so the steady state is a cheap 304.
+# auto_refresh_interval_secs = 300
 
 # Restrict which repos appear in the mount.
 # "self-only" (default), "all", or an array of owner logins.
@@ -683,6 +702,7 @@ Notes:
 | `GITHUB_TOKEN` | Fallback PAT, accepted for compatibility. |
 | `GHFS_CACHE_DIR` | Override the cache directory. |
 | `GHFS_CACHE_TTL_SECS` | Override `cache_ttl_secs`. |
+| `GHFS_AUTO_REFRESH_INTERVAL_SECS` | Override `auto_refresh_interval_secs`. `0` disables. |
 | `GHFS_MOUNT_PATH` | Default mount path. |
 | `GHFS_LOG_LEVEL` | `tracing` filter string, e.g. `ghfs=debug`. |
 | `GHFS_OWNERS` | Override `owners`. Accepts a preset (`self-only`, `all`), a single login, or a comma-separated list (e.g. `alice,rust-lang`). |
@@ -712,6 +732,7 @@ Per-subcommand flags are listed under [Subcommands](#subcommands).
 | `~/.cache/ghfs/blobs/aa/<sha>` | Content-addressed blob store. |
 | `~/.cache/ghfs/clones/<owner>/<repo>.git` | Bare libgit2 clones (only present when `[clone] trigger` is enabled). |
 | `~/.cache/ghfs/clones/<owner>/<repo>/<branch>/` | Per-branch worktrees (only present when `trigger = "on_access"`). |
+| `~/.cache/ghfs/mounts/<encoded-mountpath>.pid` | Pidfile per live mount, used by `ghfs refresh` to signal `SIGUSR1`. Removed on graceful shutdown; stale entries reaped by `ghfs refresh`. |
 
 ## Cache layout
 

@@ -85,6 +85,7 @@ fn env_only_config() -> config::Config {
         cache_dir: std::path::PathBuf::from("/tmp/ghfs-cache"),
         log_level: None,
         cache_ttl_secs: 300,
+        auto_refresh_interval_secs: None,
         owners: config::Owners::default(),
         include_forks: false,
         visibility: config::Visibility::default(),

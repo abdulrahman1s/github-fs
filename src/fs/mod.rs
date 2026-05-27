@@ -465,6 +465,74 @@ impl Ghfs {
         });
     }
 
+    /// Clonable handle that re-fetches the repo list and swaps the
+    /// in-memory snapshot. Used by `spawn_auto_refresh` and by external
+    /// triggers (SIGUSR1 from `ghfs refresh`) — both want exactly this
+    /// effect with no extra coupling to the rest of `Ghfs`.
+    pub fn repo_refresh_handle(&self) -> RepoRefreshHandle {
+        RepoRefreshHandle {
+            client: self.client.clone(),
+            meta: self.meta.clone(),
+            filter: self.filter.clone(),
+            repo_cache: Arc::clone(&self.repo_cache),
+            warmed_up: Arc::clone(&self.warmed_up),
+            fetch_lock: Arc::clone(&self.fetch_lock),
+        }
+    }
+
+    /// Spawn a background task that periodically re-fetches the repo list
+    /// so repos created on GitHub mid-session appear in the mount without
+    /// a remount. Repeats lean on the ETag stored in `etags`/`branch_heads`
+    /// so the steady state is a 304 per tick.
+    ///
+    /// Only the repo *snapshot* is refreshed — already-allocated inodes
+    /// keep their identity, so a shell `cwd` inside a repo is unaffected.
+    /// Newly-discovered repos become visible on the next kernel readdir
+    /// of the relevant owner dir (subject to the dentry TTL).
+    pub fn spawn_auto_refresh(&self, interval: Duration) {
+        let handle = self.repo_refresh_handle();
+        info!(interval_secs = interval.as_secs(), "scheduling repo-list auto-refresh");
+        self.handle.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // `interval`'s first tick fires immediately; drop it so we
+            // don't double up with the initial prefetch that mount.rs
+            // also kicks off at startup.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match handle.refresh_now().await {
+                    Ok(n) => debug!(repos = n, "auto-refresh: repo snapshot updated"),
+                    Err(e) => warn!(error = %e, "auto-refresh: repo list refresh failed"),
+                }
+            }
+        });
+    }
+
+    /// Spawn a task that listens for SIGUSR1 and refreshes the snapshot
+    /// each time. `ghfs refresh` sends this signal after writing the
+    /// fresh list to sqlite, so the running mount picks it up
+    /// immediately without waiting for the auto-refresh tick.
+    pub fn spawn_refresh_signal_listener(&self) {
+        let handle = self.repo_refresh_handle();
+        self.handle.spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "failed to install SIGUSR1 handler; `ghfs refresh` cannot push to this mount");
+                    return;
+                }
+            };
+            info!("listening for SIGUSR1 to refresh repo list on demand");
+            while sigusr1.recv().await.is_some() {
+                match handle.refresh_now().await {
+                    Ok(n) => info!(repos = n, "SIGUSR1 refresh: repo snapshot updated"),
+                    Err(e) => warn!(error = %e, "SIGUSR1 refresh: repo list refresh failed"),
+                }
+            }
+        });
+    }
+
     /// Resolve HEAD to a root tree SHA once per repo/branch in this mount.
     fn repo_tree_sha(&self, repo: &RepoRef, default_branch: &str) -> Result<String, GhfsError> {
         let key = (repo.repo_id, default_branch.to_string());
@@ -1426,6 +1494,41 @@ fn branch_cache_result(
             );
             Err(GhfsError::Github(GithubError::NotFound))
         }
+    }
+}
+
+/// Shared state needed to re-fetch the repo list and swap the live
+/// in-memory snapshot. Cheap to clone (all `Arc`s).
+#[derive(Clone)]
+pub struct RepoRefreshHandle {
+    client: Arc<GithubClient>,
+    meta: Arc<MetaCache>,
+    filter: Arc<RepoFilter>,
+    repo_cache: Arc<RwLock<Option<Arc<RepoSnapshot>>>>,
+    warmed_up: Arc<AtomicBool>,
+    fetch_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl RepoRefreshHandle {
+    /// Re-fetch from GitHub (ETag-conditional, so a steady-state mount
+    /// pays a 304) and replace the in-memory snapshot. Returns the new
+    /// snapshot size.
+    pub async fn refresh_now(&self) -> Result<usize, GhfsError> {
+        let _guard = self.fetch_lock.lock().await;
+        let repos = load_repos_async(
+            self.client.clone(),
+            self.meta.clone(),
+            self.filter.clone(),
+            self.warmed_up.clone(),
+        )
+        .await?;
+        let snapshot = Arc::new(RepoSnapshot::new(repos));
+        let len = snapshot.len();
+        *self
+            .repo_cache
+            .write()
+            .expect("Ghfs.repo_cache poisoned") = Some(snapshot);
+        Ok(len)
     }
 }
 

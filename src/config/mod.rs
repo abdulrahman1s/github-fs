@@ -10,6 +10,7 @@ use thiserror::Error;
 use self::token::Token;
 
 const DEFAULT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_AUTO_REFRESH_INTERVAL_SECS: u64 = 300;
 const FALLBACK_CACHE_DIR: &str = "/tmp/ghfs-cache";
 
 /// Which repository owners should appear in the mounted filesystem.
@@ -223,6 +224,7 @@ struct ConfigFile {
     cache_dir: Option<PathBuf>,
     log_level: Option<String>,
     cache_ttl_secs: Option<u64>,
+    auto_refresh_interval_secs: Option<u64>,
     owners: Option<OwnersFile>,
     include_forks: Option<bool>,
     visibility: Option<String>,
@@ -236,6 +238,12 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub log_level: Option<String>,
     pub cache_ttl_secs: u64,
+    /// How often a running mount re-fetches the repo list in the
+    /// background, so repos created on GitHub mid-session appear in the
+    /// mount without a restart. Defaults to 5 minutes; set to `0` to
+    /// disable. Repeat fetches send `If-None-Match` and usually 304, so
+    /// the cost is one cheap conditional request per tick.
+    pub auto_refresh_interval_secs: Option<u64>,
     /// Restricts which repo owners are mounted. Defaults to `SelfOnly`.
     pub owners: Owners,
     /// When false (default), fork repos are hidden from the mount. Forks are
@@ -308,6 +316,20 @@ fn resolve(file: ConfigFile, env: &HashMap<String, String>, file_present: bool) 
         .or(file.cache_ttl_secs)
         .unwrap_or(DEFAULT_CACHE_TTL_SECS);
 
+    // `0` is the explicit "disabled" sentinel — distinguished from
+    // "user didn't set it" so the default doesn't override a deliberate
+    // opt-out.
+    let auto_refresh_interval_secs = env
+        .get("GHFS_AUTO_REFRESH_INTERVAL_SECS")
+        .and_then(|s| s.parse().ok())
+        .or(file.auto_refresh_interval_secs)
+        .unwrap_or(DEFAULT_AUTO_REFRESH_INTERVAL_SECS);
+    let auto_refresh_interval_secs = if auto_refresh_interval_secs == 0 {
+        None
+    } else {
+        Some(auto_refresh_interval_secs)
+    };
+
     let owners = env
         .get("GHFS_OWNERS")
         .and_then(|s| Owners::parse_env(s))
@@ -347,6 +369,7 @@ fn resolve(file: ConfigFile, env: &HashMap<String, String>, file_present: bool) 
         cache_dir,
         log_level,
         cache_ttl_secs,
+        auto_refresh_interval_secs,
         owners,
         include_forks,
         visibility,
@@ -472,6 +495,43 @@ mod tests {
         // cache_dir resolves either to a ProjectDirs path or the fallback —
         // both are absolute and non-empty.
         assert!(!cfg.cache_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn auto_refresh_defaults_to_five_minutes() {
+        let cfg = resolve(ConfigFile::default(), &HashMap::new(), false);
+        assert_eq!(
+            cfg.auto_refresh_interval_secs,
+            Some(DEFAULT_AUTO_REFRESH_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn auto_refresh_parses_from_toml() {
+        let cf: ConfigFile = toml::from_str(r#"auto_refresh_interval_secs = 60"#).unwrap();
+        let cfg = resolve(cf, &HashMap::new(), true);
+        assert_eq!(cfg.auto_refresh_interval_secs, Some(60));
+    }
+
+    #[test]
+    fn auto_refresh_env_overrides_file() {
+        let cf: ConfigFile = toml::from_str(r#"auto_refresh_interval_secs = 60"#).unwrap();
+        let cfg = resolve(cf, &env(&[("GHFS_AUTO_REFRESH_INTERVAL_SECS", "120")]), true);
+        assert_eq!(cfg.auto_refresh_interval_secs, Some(120));
+    }
+
+    #[test]
+    fn auto_refresh_zero_is_disabled() {
+        let cf: ConfigFile = toml::from_str(r#"auto_refresh_interval_secs = 0"#).unwrap();
+        let cfg = resolve(cf, &HashMap::new(), true);
+        assert_eq!(cfg.auto_refresh_interval_secs, None);
+    }
+
+    #[test]
+    fn auto_refresh_env_unparseable_falls_back_to_file() {
+        let cf: ConfigFile = toml::from_str(r#"auto_refresh_interval_secs = 90"#).unwrap();
+        let cfg = resolve(cf, &env(&[("GHFS_AUTO_REFRESH_INTERVAL_SECS", "nope")]), true);
+        assert_eq!(cfg.auto_refresh_interval_secs, Some(90));
     }
 
     #[test]

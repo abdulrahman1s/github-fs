@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use fuser::{MountOption, Session};
@@ -87,6 +88,27 @@ pub fn run(
     // touches the mount. If the kernel races ahead, the FUSE-driven
     // `list_repos` waits on `fetch_lock` instead of duplicating the call.
     fs.spawn_background_prefetch();
+    fs.spawn_refresh_signal_listener();
+
+    if let Some(secs) = cfg.auto_refresh_interval_secs {
+        fs.spawn_auto_refresh(Duration::from_secs(secs));
+    }
+
+    // Drop a pidfile keyed by mount path so `ghfs refresh` can find and
+    // SIGUSR1 every running mount sharing this cache dir. Cleaned up by
+    // the signal-unmounter on graceful shutdown; stale entries from
+    // crashes are reaped by `ghfs refresh` itself.
+    let pidfile = pidfile_path(&cache_dir, &mount_path);
+    if let Some(parent) = pidfile.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Two lines: PID and mountpoint. The pidfile name is encoded, so
+    // storing the mountpoint inside lets `ghfs refresh` print a
+    // human-readable path without round-tripping the encoding.
+    let pidfile_contents = format!("{}\n{}\n", std::process::id(), mount_path.display());
+    if let Err(e) = std::fs::write(&pidfile, &pidfile_contents) {
+        warn!(error = %e, path = %pidfile.display(), "could not write mount pidfile; `ghfs refresh` won't notify this mount");
+    }
 
     // The kernel `RO` flag would block every write op up front — but that
     // also blocks writes to materialized branches, which we want to allow
@@ -108,7 +130,7 @@ pub fn run(
         warn!("backgrounding not yet implemented; running in foreground (Ctrl-C to unmount)");
     }
 
-    install_signal_unmounter(handle, mount_path.clone());
+    install_signal_unmounter(handle, mount_path.clone(), pidfile.clone());
 
     info!("mounting at {}", mount_path.display());
     let mut session =
@@ -128,7 +150,18 @@ pub fn run(
 /// Installing `tokio::signal::unix::signal` replaces the default SIGINT/SIGTERM
 /// dispositions process-wide; the kernel will no longer kill us on Ctrl-C, so
 /// the unmount path here is the only thing that ends the process.
-fn install_signal_unmounter(handle: Handle, mount_path: PathBuf) {
+/// Deterministic pidfile location for a given (cache_dir, mount_path).
+/// `ghfs refresh` reads every entry under `<cache>/mounts/` so the
+/// mapping just needs to be collision-resistant across mountpoints.
+pub fn pidfile_path(cache_dir: &std::path::Path, mount_path: &std::path::Path) -> PathBuf {
+    let encoded = mount_path
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('/', "%2F");
+    cache_dir.join("mounts").join(format!("{encoded}.pid"))
+}
+
+fn install_signal_unmounter(handle: Handle, mount_path: PathBuf, pidfile: PathBuf) {
     let result = std::thread::Builder::new()
         .name("ghfs-signal".into())
         .spawn(move || {
@@ -171,6 +204,12 @@ fn install_signal_unmounter(handle: Handle, mount_path: PathBuf) {
                         error = %e,
                         "failed to invoke fusermount3 -u; falling back to process exit"
                     ),
+                }
+
+                if let Err(e) = std::fs::remove_file(&pidfile)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(error = %e, path = %pidfile.display(), "failed to remove mount pidfile");
                 }
             });
         });

@@ -3,9 +3,9 @@
 **Your entire GitHub, as a folder.**
 
 `ghfs` mounts every repository your token can see as a single
-filesystem on Linux. Browse it with `ls`, search it with `rg`, open
-it in your editor. Every tool that takes a path just works, across
-every repo you can reach. When you actually want to change something,
+filesystem on Linux. Browse it with `ls`, open files in your editor,
+read what you need on demand. Every tool that takes a path just works,
+across every repo you can reach. When you actually want to change something,
 `ghfs promote` flips one repo into a real on-disk git worktree
 in-place, so `vim`, `git commit`, and `git push` flow straight through
 the mount.
@@ -53,8 +53,11 @@ just becomes writable, backed by a real git checkout.
 - **You work across a lot of repos.** An org with dozens of services,
   a personal account with years of side projects, or just open source
   you keep cloning into `~/code` and forgetting about.
-- **You live in a terminal.** `rg`, `fd`, `fzf`, `vim`/`nvim`, `bat`,
-  anything that consumes paths is now a multi-repo tool.
+- **You live in a terminal.** `fd`, `fzf`, `vim`/`nvim`, `bat`,
+  anything that consumes paths is now a multi-repo tool. (Avoid tools
+  that bulk-read file contents across the mount — every uncached file
+  is a GitHub API round-trip; reach for `ghfs promote` first if you
+  want to grep a whole repo.)
 - **You want to read code without ceremony.** Skim a dependency's
   source, look up how an upstream project handles something, share a
   path with a colleague. No "let me clone it first."
@@ -158,6 +161,7 @@ ghfs unmount ~/ghfs
 ghfs status
 
 # force-refresh the cached repo list (after creating/deleting repos on GitHub)
+# — also signals every running mount via SIGUSR1 to pick up the change in place
 ghfs refresh
 ```
 
