@@ -37,6 +37,13 @@ const TTL: Duration = Duration::from_secs(60);
 /// between virtual and passthrough, and the kernel's cached child dentries
 /// need to expire before the new mode is observed.
 const REPO_ENTRY_TTL: Duration = Duration::from_secs(1);
+/// Passthrough entries can't safely cache attrs at all: writes through
+/// the mount mutate the disk file in place, and the kernel doesn't
+/// invalidate attrs on `write` replies. A stale cached size from a
+/// post-truncate `setattr` would otherwise persist until the next
+/// `lookup`/`getattr` round-trip, making `stat`/`ls -la` show 0 bytes
+/// for ~60s after every `O_TRUNC` write. Force a re-ask on every stat.
+const ZERO_TTL: Duration = Duration::ZERO;
 
 pub struct Ghfs {
     handle: Handle,
@@ -127,10 +134,25 @@ impl Ghfs {
     /// real disk state), otherwise builds the virtual attr from the inode
     /// kind's cached fields.
     fn attr(&self, ino: u64, kind: &InodeKind) -> FileAttr {
-        if let Some(meta) = self.passthrough_metadata(kind) {
+        if let Some(meta) = self.passthrough_metadata(ino) {
             return build_attr_from_metadata(ino, &meta, self.uid, self.gid);
         }
         build_attr(ino, kind, self.now, self.uid, self.gid)
+    }
+
+    /// TTL to attach to attrs/entries we hand back to the kernel.
+    /// Mirrors `ttl_for_kind` for virtual inodes, but forces `ZERO_TTL`
+    /// whenever the inode resolves through a materialized worktree:
+    /// writes via the mount, `git`-side mutations, and external edits
+    /// against the on-disk worktree all bypass the kernel's attr cache,
+    /// so we can't safely cache disk-backed size/mtime/perm at all. The
+    /// extra getattr round-trip per stat is cheap; the alternative is
+    /// `stat` returning a 0-byte size for ~60s after every `O_TRUNC`.
+    fn ttl_for_attr(&self, ino: u64, kind: &InodeKind) -> &'static Duration {
+        if self.passthrough_disk_path(ino).is_some() {
+            return &ZERO_TTL;
+        }
+        ttl_for_kind(kind)
     }
 
     /// Return the absolute path of the on-disk worktree for `(repo, branch)`
@@ -153,47 +175,58 @@ impl Ghfs {
         }
     }
 
-    /// Project an inode kind to `(repo, branch, rel_path_under_repo)` if
-    /// it lives under a repo with a resolved branch (which is the only
-    /// place passthrough applies). `Repo` itself maps to rel_path = "".
-    /// Returns `None` for `Repo` with an empty branch (no branch
-    /// resolvable) — passthrough is impossible without a branch identity.
-    fn branch_relative_path<'a>(
-        &self,
-        kind: &'a InodeKind,
-    ) -> Option<(&'a RepoRef, &'a str, &'a str)> {
-        match kind {
-            InodeKind::Repo { repo, branch } if !branch.is_empty() => {
-                Some((repo, branch.as_str(), ""))
+    /// Project `ino` to `(repo, branch, rel_path_under_repo)` by walking
+    /// up through `InodeTable::parent_link` until a `Repo` ancestor with
+    /// a resolved branch is reached. `Repo` itself maps to rel_path = "".
+    /// `None` means this inode does not sit under a passthrough-eligible
+    /// repo (either it's outside the per-repo subtree, or the repo has
+    /// an empty branch).
+    ///
+    /// The walk uses parent links rather than the `path` field on each
+    /// kind because that field is captured at allocation time and goes
+    /// stale across `rename(2)`. Walking the live linkage keeps disk
+    /// resolution correct for the renamed inode AND for any inode
+    /// underneath it (whose own names don't change on a parent rename).
+    fn branch_relative_path(&self, ino: u64) -> Option<(RepoRef, String, String)> {
+        let mut names: Vec<String> = Vec::new();
+        let mut cur = ino;
+        loop {
+            let kind = self.inodes.get(cur)?;
+            match &*kind {
+                InodeKind::Repo { repo, branch } => {
+                    if branch.is_empty() {
+                        return None;
+                    }
+                    let rel = if names.is_empty() {
+                        String::new()
+                    } else {
+                        names.reverse();
+                        names.join("/")
+                    };
+                    return Some((repo.clone(), branch.clone(), rel));
+                }
+                InodeKind::Root | InodeKind::Owner { .. } => return None,
+                _ => {
+                    let (parent, name) = self.inodes.parent_link(cur)?;
+                    names.push(name);
+                    cur = parent;
+                }
             }
-            InodeKind::Dir {
-                repo, branch, path, ..
-            }
-            | InodeKind::File {
-                repo, branch, path, ..
-            }
-            | InodeKind::Symlink {
-                repo, branch, path, ..
-            }
-            | InodeKind::Submodule { repo, branch, path } => {
-                Some((repo, branch.as_str(), path.as_str()))
-            }
-            _ => None,
         }
     }
 
-    /// Disk path for `kind` iff its branch has been materialized as a
+    /// Disk path for `ino` iff its branch has been materialized as a
     /// worktree. Used by every op that wants to read/list/open the real
     /// thing instead of the virtual GitHub view.
-    fn passthrough_disk_path(&self, kind: &InodeKind) -> Option<std::path::PathBuf> {
-        let (repo, branch, rel) = self.branch_relative_path(kind)?;
-        let root = self.worktree_root_for(repo, branch)?;
+    fn passthrough_disk_path(&self, ino: u64) -> Option<std::path::PathBuf> {
+        let (repo, branch, rel) = self.branch_relative_path(ino)?;
+        let root = self.worktree_root_for(&repo, &branch)?;
         Some(if rel.is_empty() { root } else { root.join(rel) })
     }
 
     /// `symlink_metadata` against the passthrough disk path, if one exists.
-    fn passthrough_metadata(&self, kind: &InodeKind) -> Option<std::fs::Metadata> {
-        let disk = self.passthrough_disk_path(kind)?;
+    fn passthrough_metadata(&self, ino: u64) -> Option<std::fs::Metadata> {
+        let disk = self.passthrough_disk_path(ino)?;
         std::fs::symlink_metadata(&disk).ok()
     }
 
@@ -284,12 +317,8 @@ impl Ghfs {
     /// inode does not sit under a materialized worktree, which is the
     /// signal write ops use to short-circuit with `EROFS`.
     fn passthrough_ctx(&self, ino: u64) -> Option<(std::path::PathBuf, RepoRef, String, String)> {
-        let kind = self.inodes.get(ino)?;
-        let (repo, branch, rel) = self.branch_relative_path(&kind)?;
-        let repo = repo.clone();
-        let branch = branch.to_string();
-        let rel = rel.to_string();
-        let disk = self.passthrough_disk_path(&kind)?;
+        let (repo, branch, rel) = self.branch_relative_path(ino)?;
+        let disk = self.passthrough_disk_path(ino)?;
         Some((disk, repo, branch, rel))
     }
 
@@ -1653,12 +1682,16 @@ fn encode_branch_name(name: &str) -> String {
     out
 }
 
-/// Pick the kernel entry-cache TTL based on inode kind. Repo entries get
-/// `REPO_ENTRY_TTL` so an out-of-band clone (e.g. `ghfs promote` from
-/// another process) is picked up promptly — the inode itself doesn't flip
-/// any more, but the kernel's *next* lookup is what swings the FS into
-/// passthrough mode for the rest of the tree. Other entry kinds keep the
-/// longer `TTL`.
+/// Pick the kernel entry-cache TTL based on inode kind alone. Repo
+/// entries get `REPO_ENTRY_TTL` so an out-of-band clone (e.g. `ghfs
+/// promote` from another process) is picked up promptly — the inode
+/// itself doesn't flip any more, but the kernel's *next* lookup is what
+/// swings the FS into passthrough mode for the rest of the tree. Other
+/// entry kinds keep the longer `TTL`.
+///
+/// Prefer `Ghfs::ttl_for_attr` when an `ino` is available: it can detect
+/// passthrough resolution and force `ZERO_TTL` so the kernel doesn't
+/// cache disk-backed attrs through out-of-band writes.
 fn ttl_for_kind(kind: &InodeKind) -> &'static Duration {
     match kind {
         InodeKind::Repo { .. } => &REPO_ENTRY_TTL,
@@ -1807,7 +1840,7 @@ impl Filesystem for Ghfs {
             Ok(Some((ino, kind))) => {
                 debug!(ino, path = %path, kind = kind_name(&kind), "lookup hit");
                 let attr = self.attr(ino, &kind);
-                reply.entry(ttl_for_kind(&kind), &attr, 0);
+                reply.entry(self.ttl_for_attr(ino, &kind), &attr, 0);
             }
             Ok(None) => {
                 debug!(path = %path, "lookup miss");
@@ -1831,7 +1864,7 @@ impl Filesystem for Ghfs {
                     "getattr"
                 );
                 let attr = self.attr(ino, &kind);
-                reply.attr(ttl_for_kind(&kind), &attr);
+                reply.attr(self.ttl_for_attr(ino, &kind), &attr);
             }
             None => {
                 debug!(ino, "getattr missing");
@@ -2007,7 +2040,7 @@ impl Filesystem for Ghfs {
                 child.ino,
                 (i + 1) as i64,
                 &child.name,
-                ttl_for_kind(&child.kind),
+                self.ttl_for_attr(child.ino, &child.kind),
                 &attr,
                 0,
             ) {
@@ -2062,7 +2095,7 @@ impl Filesystem for Ghfs {
         // the real on-disk file with whatever access mode the caller
         // asked for (RDONLY / WRONLY / RDWR). Writes happen via `write_at`
         // on this same handle.
-        if let Some(disk) = self.passthrough_disk_path(&kind) {
+        if let Some(disk) = self.passthrough_disk_path(ino) {
             let accmode = flags & libc::O_ACCMODE;
             let mut opts = std::fs::OpenOptions::new();
             opts.read(accmode != libc::O_WRONLY)
@@ -2186,7 +2219,7 @@ impl Filesystem for Ghfs {
             InodeKind::Symlink { repo, blob_sha, .. } => {
                 // Passthrough: read the real symlink off disk so the kernel
                 // walks to whatever the on-disk worktree currently points at.
-                if let Some(disk) = self.passthrough_disk_path(&kind) {
+                if let Some(disk) = self.passthrough_disk_path(ino) {
                     match std::fs::read_link(&disk) {
                         Ok(target) => reply.data(target.as_os_str().as_encoded_bytes()),
                         Err(e) => {
@@ -2326,7 +2359,7 @@ impl Filesystem for Ghfs {
             self.passthrough_allocate(parent, name_str, &repo, &branch, &parent_rel, &metadata);
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
         let fh = self.open_files.insert(file);
-        reply.created(ttl_for_kind(&kind), &attr, 0, fh, 0);
+        reply.created(self.ttl_for_attr(ino, &kind), &attr, 0, fh, 0);
     }
 
     fn write(
@@ -2384,7 +2417,7 @@ impl Filesystem for Ghfs {
             // Pure stat. The kernel can issue setattr with no fields set
             // as a getattr-equivalent; return current attrs.
             let attr = self.attr(ino, &kind);
-            reply.attr(ttl_for_kind(&kind), &attr);
+            reply.attr(self.ttl_for_attr(ino, &kind), &attr);
             return;
         }
 
@@ -2476,7 +2509,7 @@ impl Filesystem for Ghfs {
             }
         };
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
-        reply.attr(ttl_for_kind(&kind), &attr);
+        reply.attr(self.ttl_for_attr(ino, &kind), &attr);
     }
 
     fn mkdir(
@@ -2530,7 +2563,7 @@ impl Filesystem for Ghfs {
         let (ino, kind) =
             self.passthrough_allocate(parent, name_str, &repo, &branch, &parent_rel, &metadata);
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
-        reply.entry(ttl_for_kind(&kind), &attr, 0);
+        reply.entry(self.ttl_for_attr(ino, &kind), &attr, 0);
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -2620,8 +2653,22 @@ impl Filesystem for Ghfs {
 
         match std::fs::rename(&src, &dst) {
             Ok(()) => {
-                self.inodes.evict(parent, name_str);
-                self.inodes.evict(newparent, newname_str);
+                // Move the inode in our table rather than evicting both
+                // names. POSIX rename preserves the inode of the renamed
+                // file: any kernel-cached dentry, open fd, or in-flight
+                // FUSE op against the source ino must keep resolving to
+                // the same file post-rename. Disk-path resolution walks
+                // up via `parent_link`, so the relocated ino now points
+                // at `dst` automatically. If there was nothing to
+                // relocate (kernel-only rename racing our state), fall
+                // back to the conservative double-evict.
+                if self
+                    .inodes
+                    .relocate(parent, name_str, newparent, newname_str)
+                    .is_none()
+                {
+                    self.inodes.evict(newparent, newname_str);
+                }
                 reply.ok();
             }
             Err(e) => {
@@ -2665,7 +2712,7 @@ impl Filesystem for Ghfs {
         let (ino, kind) =
             self.passthrough_allocate(parent, name_str, &repo, &branch, &parent_rel, &metadata);
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
-        reply.entry(ttl_for_kind(&kind), &attr, 0);
+        reply.entry(self.ttl_for_attr(ino, &kind), &attr, 0);
     }
 
     fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
@@ -3015,8 +3062,8 @@ mod passthrough_tests {
         assert_eq!(repo_ino_before, repo_ino_after);
         assert!(matches!(*kind_after, InodeKind::Repo { .. }));
 
-        // The disk path is now resolvable from this very same inode kind.
-        assert!(fs.passthrough_disk_path(&kind_after).is_some());
+        // The disk path is now resolvable from this very same inode.
+        assert!(fs.passthrough_disk_path(repo_ino_after).is_some());
     }
 
     #[test]
@@ -3196,6 +3243,50 @@ mod passthrough_tests {
         assert_ne!(
             ino_before, ino_after,
             "post-evict reallocation must produce a new ino so kernel page cache can't alias the two files"
+        );
+    }
+
+    #[test]
+    fn rename_preserves_ino_and_redirects_disk_resolution() {
+        // Regression for the nix-direnv pattern that surfaced as EIO:
+        //   symlink(.0_foo, target) → rename(.0_foo, foo) → readlink(foo)
+        // The kernel keeps using the inode it got for `.0_foo`, so the
+        // readlink dispatches with that same ino. If disk-path
+        // resolution still believes the inode lives at `.0_foo` (its
+        // allocation-time `path` field), it stats a renamed-away name
+        // and returns ENOENT/EIO. With parent-link-driven resolution,
+        // the same ino now resolves to `foo` automatically.
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, _rt) = build_fs(temp.path());
+        let repo = rref();
+        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
+
+        let (repo_ino, _) =
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "widgets", || InodeKind::Repo {
+                    repo: repo.clone(),
+                    branch: "main".into(),
+                });
+
+        // Stage the on-disk side of "symlink .0_link → /target".
+        std::os::unix::fs::symlink("/target", wt.join(".0_link")).unwrap();
+        let metadata = std::fs::symlink_metadata(wt.join(".0_link")).unwrap();
+        let (link_ino, link_kind) =
+            fs.passthrough_allocate(repo_ino, ".0_link", &repo, "main", "", &metadata);
+        assert!(matches!(*link_kind, InodeKind::Symlink { .. }));
+        assert_eq!(fs.passthrough_disk_path(link_ino), Some(wt.join(".0_link")));
+
+        // Atomic-rename on disk + in the inode table.
+        std::fs::rename(wt.join(".0_link"), wt.join("link")).unwrap();
+        let relocated = fs.inodes.relocate(repo_ino, ".0_link", repo_ino, "link");
+        assert_eq!(relocated, Some(link_ino), "ino must survive the rename");
+
+        // The same ino now resolves to the new on-disk name — readlink
+        // against this ino will succeed instead of returning EIO.
+        assert_eq!(fs.passthrough_disk_path(link_ino), Some(wt.join("link")));
+        assert_eq!(
+            std::fs::read_link(fs.passthrough_disk_path(link_ino).unwrap()).unwrap(),
+            std::path::Path::new("/target")
         );
     }
 }
