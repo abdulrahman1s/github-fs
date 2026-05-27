@@ -147,8 +147,10 @@ User-visible surface includes:
   Quickstart.
 - **Configuration** — new TOML key, env var, or change to defaults /
   precedence. Update `DOCS.md#configuration` (TOML example, env-var
-  table, any subsection that explains semantics) and add at least a
-  pointer from `README.md` if the option is non-obvious.
+  table, any subsection that explains semantics), the root
+  `example.config.toml` (add/update the commented block for the key,
+  including its env var, default, and accepted values), and add at
+  least a pointer from `README.md` if the option is non-obvious.
 - **Filesystem layout / mount semantics** — anything that changes what
   `ls`, `cat`, `stat`, or `readlink` will observe. Update
   `DOCS.md#filesystem-layout` and `DOCS.md#mount-semantics`; if it

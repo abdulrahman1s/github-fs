@@ -1,0 +1,113 @@
+# ghfs — example configuration file
+#
+# Copy to `~/.config/ghfs/config.toml` and edit. Every key is optional;
+# unset keys fall back to the documented defaults. Unknown keys are
+# rejected so typos surface immediately.
+#
+# Resolution order (later wins): config file → env vars → CLI flags.
+# Each key's matching env var is noted in the comment above it. See
+# DOCS.md#configuration for the full reference.
+#
+# Tip: `chmod 0600 ~/.config/ghfs/config.toml` — it holds a credential.
+
+# --- Authentication --------------------------------------------------------
+
+# GitHub Personal Access Token. Classic or fine-grained both work.
+# Env: GHFS_TOKEN (preferred) or GITHUB_TOKEN (fallback).
+# CLI: --token
+# Default: none (ghfs runs unauthenticated; most ops will fail).
+# token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# --- Paths -----------------------------------------------------------------
+
+# Default mountpoint used by `ghfs mount` when no path is given.
+# Env: GHFS_MOUNT_PATH
+# Default: none (mount path must be supplied on the CLI).
+# mount_path = "/home/you/ghfs"
+
+# Where ghfs stores its SQLite metadata, blob cache, and (optionally)
+# libgit2 clones.
+# Env: GHFS_CACHE_DIR
+# Default: XDG cache dir (typically `~/.cache/ghfs`), fallback `/tmp/ghfs-cache`.
+# cache_dir = "/home/you/.cache/ghfs"
+
+# --- Logging ---------------------------------------------------------------
+
+# `tracing` filter string. Examples: "ghfs=info", "ghfs=debug,warn".
+# Env: GHFS_LOG_LEVEL (RUST_LOG also works, lower precedence).
+# CLI: --log-level
+# Default: "ghfs=info,warn".
+# log_level = "ghfs=info"
+
+# --- Caching ---------------------------------------------------------------
+
+# TTL (seconds) for cached resources that don't carry ETags. Resources
+# that do carry ETags use conditional GETs instead and ignore this value.
+# Env: GHFS_CACHE_TTL_SECS
+# Default: 300 (5 minutes).
+# cache_ttl_secs = 300
+
+# How often a running mount re-fetches the repo list in the background,
+# so repos created on GitHub mid-session appear without a remount. Each
+# tick sends `If-None-Match` and usually 304s, so the steady-state cost
+# is one cheap conditional request per interval. Set to 0 to disable.
+# Env: GHFS_AUTO_REFRESH_INTERVAL_SECS
+# Default: 300 (5 minutes).
+# auto_refresh_interval_secs = 300
+
+# --- Repo filters ----------------------------------------------------------
+
+# Which owners are visible in the mount.
+#   "self-only" (default) — only repos owned by the authenticated user.
+#   "all"                 — every repo the token can see (owned,
+#                           collaborator, and organization-member).
+#   ["alice", "rust-lang"] — allowlist of owner logins (case-insensitive).
+#   "alice"               — shorthand for a single-owner allowlist; a
+#                           typo'd preset becomes a list-of-one rather
+#                           than silently falling back to "self-only".
+# Env: GHFS_OWNERS (preset, single login, or comma-separated list).
+# Default: "self-only".
+# owners = "self-only"
+# owners = "all"
+# owners = ["abdulrahman1s", "rust-lang"]
+
+# Whether fork repositories appear in the mount. Forks are noise for
+# most read-only browsing; flip to true if you maintain long-lived fork
+# branches.
+# Env: GHFS_INCLUDE_FORKS — accepts 1/0, true/false, yes/no, on/off.
+# Default: false.
+# include_forks = false
+
+# Filter repos by GitHub's `private` flag. Applied client-side alongside
+# the fork/owner filters, so changing this between sessions retrims the
+# cached list rather than triggering a refetch.
+#   "all" (default)                — no visibility filtering.
+#   "public" / "public-only"       — only public repos.
+#   "private" / "private-only"     — only private repos.
+# Env: GHFS_VISIBILITY
+# Default: "all".
+# visibility = "all"
+
+# --- On-demand libgit2 clone ----------------------------------------------
+
+# When a clone is present, tree listings and blob reads are served from
+# the local object DB (offline-capable, no per-blob HTTP round-trip).
+# The GitHub API path remains the fallback when a clone is missing or
+# any libgit2 step fails — enabling this only *adds* capability.
+#
+# Disk layout under cache_dir:
+#   clones/<owner>/<repo>.git/             # shared bare object DB
+#   clones/<owner>/<repo>/<fs_branch>/     # per-branch worktree
+[clone]
+# When to materialize a worktree:
+#   "never"     (default) — never automatically; only `ghfs promote` clones.
+#   "on_list"             — first `readdir` into a repo (e.g. `ls ~/ghfs/foo`).
+#   "on_read"             — first `open` of a file inside a repo. Listing
+#                           alone won't trigger it.
+#   "on_access"           — first lookup of a repo path (e.g. `cd ~/ghfs/foo`).
+#                           Eager: the first access blocks until the clone
+#                           completes, so the very first listing already
+#                           comes from disk.
+# Env: GHFS_CLONE_TRIGGER — accepts never/off/disabled,
+#      on_list/on-list/list, on_read/on-read/read, on_access/on-access/access.
+trigger = "never"
