@@ -1,6 +1,6 @@
 [package]
 name = "ghfs-rs"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Mount GitHub repositories as a FUSE filesystem on Linux"
 license = "MIT"
