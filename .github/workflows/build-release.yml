@@ -4,28 +4,8 @@ on:
   push:
     branches:
       - "**"
-    tags:
-      - "v*"
   pull_request:
   workflow_dispatch:
-    inputs:
-      release:
-        description: "Force a release on the current branch"
-        type: boolean
-        default: false
-      bump:
-        description: "Bump kind when release is true (auto = derive from conventional commits)"
-        type: choice
-        options:
-          - auto
-          - patch
-          - minor
-          - major
-        default: auto
-      version:
-        description: "Explicit version without the leading v; overrides bump"
-        type: string
-        required: false
 
 permissions:
   contents: read
@@ -33,206 +13,46 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: >-
-    ${{
-      !startsWith(github.ref, 'refs/tags/')
-      && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
-    }}
+    ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 env:
   BIN_NAME: ghfs
   CARGO_TERM_COLOR: always
 
 jobs:
-  prepare-release:
-    name: Prepare release version
+  release-please:
+    name: Release please
+    # Only manage releases from pushes to the default branch (or manual dispatch
+    # against it). Release PRs themselves run through the build job below for CI.
     if: >-
       ${{
-        (github.event_name == 'workflow_dispatch' && inputs.release) ||
-        (github.event_name == 'push'
-          && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-          && !startsWith(github.event.head_commit.message, 'chore: release v')
-          && !contains(github.event.head_commit.message, '[skip release]'))
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     outputs:
-      sha: ${{ steps.commit.outputs.sha }}
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
-      released: ${{ steps.version.outputs.released }}
-
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
-      - name: Checkout release branch
-        uses: actions/checkout@v6
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
         with:
-          fetch-depth: 0
-          ref: ${{ github.ref_name }}
-
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Configure git author
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Resolve next version
-        id: version
-        env:
-          INPUT_BUMP: ${{ inputs.bump || 'auto' }}
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
-            echo "Release versioning must run from a branch, not ${GITHUB_REF_TYPE}." >&2
-            exit 1
-          fi
-
-          git fetch --tags --force
-
-          current="$(awk '
-            $0 == "[package]" { in_package = 1; next }
-            /^\[/ && in_package { exit }
-            in_package && $1 == "version" {
-              gsub(/"/, "", $3)
-              print $3
-              exit
-            }
-          ' Cargo.toml)"
-
-          if [[ -z "${current}" ]]; then
-            echo "Could not read package.version from Cargo.toml." >&2
-            exit 1
-          fi
-
-          bump_kind=""
-          if [[ -n "${INPUT_VERSION}" ]]; then
-            next="${INPUT_VERSION#v}"
-            bump_kind="explicit"
-          elif [[ "${INPUT_BUMP}" != "auto" ]]; then
-            bump_kind="${INPUT_BUMP}"
-          else
-            last_tag="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
-            if [[ -z "${last_tag}" ]]; then
-              range="HEAD"
-              echo "No previous release tag; scanning full history."
-            else
-              range="${last_tag}..HEAD"
-              echo "Scanning commits in ${range}."
-            fi
-
-            # Conventional commits: feat: -> minor, fix:/perf: -> patch,
-            # any "<type>!:" subject or "BREAKING CHANGE:" footer -> major.
-            breaking_re='^[A-Za-z]+(\([^)]+\))?!:'
-            feat_re='^feat(\([^)]+\))?:'
-            fix_re='^(fix|perf)(\([^)]+\))?:'
-            commits="$(git log --format='%H%x1f%B%x1e' "${range}" || true)"
-            if [[ -n "${commits}" ]]; then
-              while IFS= read -r -d $'\x1e' entry; do
-                [[ -z "${entry}" ]] && continue
-                subject="${entry#*$'\x1f'}"
-                subject="${subject%%$'\n'*}"
-                body="${entry#*$'\x1f'}"
-
-                if [[ "${subject}" =~ $breaking_re ]] \
-                   || grep -qE '^(BREAKING[ -]CHANGE):' <<<"${body}"; then
-                  bump_kind="major"
-                  break
-                elif [[ "${subject}" =~ $feat_re ]]; then
-                  [[ "${bump_kind}" != "major" ]] && bump_kind="minor"
-                elif [[ "${subject}" =~ $fix_re ]]; then
-                  [[ -z "${bump_kind}" ]] && bump_kind="patch"
-                fi
-              done <<<"${commits}"
-            fi
-
-            if [[ -z "${bump_kind}" ]]; then
-              echo "No feat/fix/perf/breaking commits since ${last_tag:-the beginning}; skipping release."
-              echo "released=false" >> "${GITHUB_OUTPUT}"
-              exit 0
-            fi
-          fi
-
-          if [[ -z "${next:-}" ]]; then
-            if [[ ! "${current}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "Automatic ${bump_kind} bump requires a plain MAJOR.MINOR.PATCH version; current is ${current}." >&2
-              exit 1
-            fi
-
-            major="${BASH_REMATCH[1]}"
-            minor="${BASH_REMATCH[2]}"
-            patch="${BASH_REMATCH[3]}"
-
-            case "${bump_kind}" in
-              patch) patch=$((patch + 1)) ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              *) echo "Unknown bump kind: ${bump_kind}" >&2; exit 1 ;;
-            esac
-
-            next="${major}.${minor}.${patch}"
-          fi
-
-          if [[ ! "${next}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid Cargo semver version: ${next}" >&2
-            exit 1
-          fi
-
-          tag="v${next}"
-          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists." >&2
-            exit 1
-          fi
-
-          awk -v new_version="${next}" '
-            $0 == "[package]" { in_package = 1 }
-            in_package && $0 ~ /^version[[:space:]]*=/ && !done {
-              sub(/"[^"]+"/, "\"" new_version "\"")
-              done = 1
-            }
-            /^\[/ && $0 != "[package]" && in_package { in_package = 0 }
-            { print }
-            END { if (!done) exit 1 }
-          ' Cargo.toml > Cargo.toml.next
-          mv Cargo.toml.next Cargo.toml
-
-          cargo generate-lockfile
-
-          echo "Bumping ${current} -> ${next} (${bump_kind})"
-          echo "version=${next}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "released=true" >> "${GITHUB_OUTPUT}"
-
-      - name: Commit version bump and tag
-        id: commit
-        if: ${{ steps.version.outputs.released == 'true' }}
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          git diff -- Cargo.toml Cargo.lock
-          if [[ -n "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]]; then
-            git add Cargo.toml Cargo.lock
-            git commit -m "chore: release ${TAG}"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          else
-            echo "Cargo.toml already at ${TAG#v}; tagging existing HEAD."
-          fi
-          git tag -a "${TAG}" -m "${TAG}"
-          git push origin "${TAG}"
-
-          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
 
   build:
     name: Build and test (${{ matrix.target }})
     needs:
-      - prepare-release
-    if: ${{ always() && (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped') }}
+      - release-please
+    # Build runs on every push/PR. We only skip if release-please outright
+    # failed; "skipped" (non-default-branch CI) is the common case.
+    if: ${{ always() && needs.release-please.result != 'failure' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -250,7 +70,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release.outputs.sha || github.sha }}
+          ref: ${{ needs.release-please.outputs.sha || github.sha }}
 
       - name: Install Rust stable
         run: |
@@ -286,9 +106,9 @@ jobs:
         run: cargo build --locked --release
 
       - name: Package release binary
-        if: ${{ startsWith(github.ref, 'refs/tags/v') || needs.prepare-release.outputs.released == 'true' }}
+        if: ${{ needs.release-please.outputs.release_created == 'true' }}
         env:
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           mkdir -p dist
           cp "target/release/${BIN_NAME}" "dist/${BIN_NAME}"
@@ -297,20 +117,20 @@ jobs:
           shasum -a 256 "${archive}" > "${archive}.sha256"
 
       - name: Upload release artifact
-        if: ${{ startsWith(github.ref, 'refs/tags/v') || needs.prepare-release.outputs.released == 'true' }}
+        if: ${{ needs.release-please.outputs.release_created == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN_NAME }}-${{ needs.prepare-release.outputs.tag || github.ref_name }}-${{ matrix.target }}
+          name: ${{ env.BIN_NAME }}-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}
           path: |
-            ${{ env.BIN_NAME }}-${{ needs.prepare-release.outputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz
-            ${{ env.BIN_NAME }}-${{ needs.prepare-release.outputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            ${{ env.BIN_NAME }}-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN_NAME }}-${{ needs.release-please.outputs.tag_name }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
-  release:
-    name: GitHub release
-    if: ${{ always() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || needs.prepare-release.outputs.released == 'true') }}
+  release-upload:
+    name: Attach binaries to release
+    if: ${{ needs.release-please.outputs.release_created == 'true' && needs.build.result == 'success' }}
     needs:
-      - prepare-release
+      - release-please
       - build
     runs-on: ubuntu-latest
     permissions:
@@ -320,22 +140,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare-release.outputs.sha || github.sha }}
+          ref: ${{ needs.release-please.outputs.sha }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@v5
         with:
-          pattern: ${{ env.BIN_NAME }}-${{ needs.prepare-release.outputs.tag || github.ref_name }}-*
+          pattern: ${{ env.BIN_NAME }}-${{ needs.release-please.outputs.tag_name }}-*
           path: dist
           merge-multiple: true
 
-      - name: Publish GitHub release
+      - name: Upload assets and publish draft
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare-release.outputs.tag || github.ref_name }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* --verify-tag --generate-notes
-          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false --latest
