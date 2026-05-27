@@ -46,6 +46,8 @@ pub fn run(
         ));
     }
 
+    raise_nofile_to_hard_limit();
+
     let cache_dir = cache_dir_override.unwrap_or_else(|| cfg.cache_dir.clone());
     let meta_path = cache_dir.join("meta.db");
     let blob_root = cache_dir.join("blobs");
@@ -224,4 +226,56 @@ fn resolve_token(cli: Option<String>, cfg: &Config) -> Option<Token> {
     cli.filter(|s| !s.is_empty())
         .map(Token::new)
         .or_else(|| cfg.token.clone())
+}
+
+/// Raise this process's `RLIMIT_NOFILE` soft limit to the hard limit.
+///
+/// FUSE is fundamentally an fd-multiplier: every kernel-side `open` of a
+/// passthrough file holds one real fd in this process for the duration of
+/// the kernel's file handle. Under heavy load (e.g. `cargo test` linking
+/// many crates concurrently) we can blow through a low session default
+/// (commonly 1024) long before the system's hard cap. The hard cap is
+/// already what the admin allows; claiming it on startup just turns a
+/// surprising EMFILE into the steady-state behavior.
+fn raise_nofile_to_hard_limit() {
+    // SAFETY: `getrlimit`/`setrlimit` write to caller-owned storage and
+    // mutate only this process's limits.
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(error = %err, "getrlimit(RLIMIT_NOFILE) failed; leaving fd limit untouched");
+        return;
+    }
+    if rlim.rlim_cur >= rlim.rlim_max {
+        info!(
+            soft = rlim.rlim_cur,
+            hard = rlim.rlim_max,
+            "RLIMIT_NOFILE already at hard cap"
+        );
+        return;
+    }
+    let new = libc::rlimit {
+        rlim_cur: rlim.rlim_max,
+        rlim_max: rlim.rlim_max,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(
+            error = %err,
+            soft = rlim.rlim_cur,
+            hard = rlim.rlim_max,
+            "setrlimit(RLIMIT_NOFILE) failed; leaving soft limit unchanged"
+        );
+        return;
+    }
+    info!(
+        from_soft = rlim.rlim_cur,
+        to = rlim.rlim_max,
+        "raised RLIMIT_NOFILE soft limit to hard cap"
+    );
 }

@@ -1046,14 +1046,16 @@ impl Ghfs {
                 repo_tree_sha,
                 path,
             } => {
-                if let Some(clone_root) = self.clone_root_for(repo) {
-                    let parent_disk = clone_root.join(path);
+                // The `path` field is captured at allocation and goes stale
+                // across `rename(2)` of this dir or any ancestor. Resolve the
+                // live disk path from `parent_ino` via parent-link walk.
+                if let Some((parent_disk, _, _, parent_rel)) = self.passthrough_ctx(parent_ino) {
                     return self.passthrough_lookup_child(
                         parent_ino,
                         name,
                         repo,
                         branch,
-                        path,
+                        &parent_rel,
                         &parent_disk,
                     );
                 }
@@ -1171,13 +1173,15 @@ impl Ghfs {
                 repo_tree_sha,
                 path,
             } => {
-                if let Some(clone_root) = self.clone_root_for(repo) {
-                    let parent_disk = clone_root.join(path);
+                // The `path` field is captured at allocation and goes stale
+                // across `rename(2)` of this dir or any ancestor. Resolve the
+                // live disk path from `parent_ino` via parent-link walk.
+                if let Some((parent_disk, _, _, parent_rel)) = self.passthrough_ctx(parent_ino) {
                     return self.passthrough_collect_children(
                         parent_ino,
                         repo,
                         branch,
-                        path,
+                        &parent_rel,
                         &parent_disk,
                     );
                 }
@@ -3373,5 +3377,64 @@ mod passthrough_tests {
             std::fs::read_link(fs.passthrough_disk_path(link_ino).unwrap()).unwrap(),
             std::path::Path::new("/target")
         );
+    }
+
+    #[test]
+    fn readdir_after_rename_uses_live_disk_path() {
+        // Regression for the rustc-incremental pattern that surfaced as
+        // EIO during `cargo test` inside a passthrough mount:
+        //   mkdir(<X>-working) → rename(<X>-working, <X>-final) → readdir(<X>-final)
+        // The kernel keeps using the inode it got for `<X>-working`, so
+        // readdir/lookup dispatch with that ino. If `collect_children` and
+        // `do_lookup` reach for the `Dir`'s allocation-time `path` field
+        // they hit the stale `<X>-working` on disk and return EIO. With
+        // parent-link-driven resolution they pick up the live name.
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, _rt) = build_fs(temp.path());
+        let repo = rref();
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
+
+        let (repo_ino, repo_kind) =
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "widgets", || InodeKind::Repo {
+                    repo: repo.clone(),
+                    branch: "main".into(),
+                });
+
+        // Stage `s-working/` with a child blob.
+        std::fs::create_dir(wt.join("s-working")).unwrap();
+        std::fs::write(wt.join("s-working").join("child"), b"x").unwrap();
+        let dir_meta = std::fs::symlink_metadata(wt.join("s-working")).unwrap();
+        let (dir_ino, dir_kind) =
+            fs.passthrough_allocate(repo_ino, "s-working", &repo, "main", "", &dir_meta);
+        assert!(matches!(*dir_kind, InodeKind::Dir { .. }));
+
+        // Rename on disk + relocate in the inode table, mirroring what
+        // `fn rename` does for a real `rename(2)` syscall.
+        std::fs::rename(wt.join("s-working"), wt.join("s-final")).unwrap();
+        let relocated = fs
+            .inodes
+            .relocate(repo_ino, "s-working", repo_ino, "s-final");
+        assert_eq!(relocated, Some(dir_ino), "ino must survive the rename");
+
+        // readdir against the same ino must enumerate the live disk dir,
+        // not the renamed-away `s-working`.
+        let children = fs.collect_children(dir_ino, &dir_kind).expect("readdir");
+        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["child"]);
+
+        // lookup of a child under the renamed dir must also resolve via
+        // the live disk path.
+        let child = fs
+            .do_lookup(repo_ino, &repo_kind, "s-final")
+            .expect("lookup s-final")
+            .expect("present");
+        let (s_final_ino, s_final_kind) = child;
+        assert_eq!(s_final_ino, dir_ino);
+        let grand = fs
+            .do_lookup(s_final_ino, &s_final_kind, "child")
+            .expect("lookup child")
+            .expect("present");
+        assert!(matches!(*grand.1, InodeKind::File { .. }));
     }
 }
