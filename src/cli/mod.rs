@@ -46,14 +46,17 @@ pub enum Command {
         cache_dir: Option<PathBuf>,
     },
 
-    /// Unmount a GHFS mountpoint (wraps `fusermount3 -u`).
+    /// Unmount a GHFS mountpoint (wraps `fusermount3 -uz`).
     Unmount {
         path: PathBuf,
-        /// Detach the mount immediately even if it is in use. Maps to
-        /// `fusermount3 -uz`; the mount is freed once the last open handle
-        /// or `cwd` reference goes away.
+        /// Refuse to unmount when the mountpoint is busy (some process is
+        /// `cd`'d into it or has files open). The default lazy behavior
+        /// detaches the mount from the namespace immediately and lets the
+        /// kernel free it once the last reference drops; `--strict` maps
+        /// to plain `fusermount3 -u` so you get the busy error and a
+        /// hint about which process is holding the mount.
         #[arg(long)]
-        lazy: bool,
+        strict: bool,
     },
 
     /// List active ghfs mounts by scanning /proc/mounts.

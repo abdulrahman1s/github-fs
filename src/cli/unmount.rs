@@ -4,16 +4,18 @@ use std::process::{Command, Output};
 use anyhow::{Result, anyhow, bail};
 use tracing::info;
 
-/// Unmount a ghfs mountpoint by shelling out to `fusermount3 -u`.
+/// Unmount a ghfs mountpoint by shelling out to `fusermount3`.
 ///
 /// We delegate rather than re-implementing the unmount syscall because
 /// `fusermount3` is the only path that works for an unprivileged user-mount
 /// installed via the standard FUSE setuid helper.
 ///
-/// When `lazy` is true we pass `-z` as well so the kernel detaches the
-/// mount immediately even if it is still in use; the mount is freed once
-/// the last `cwd`/open handle goes away. We don't default to lazy because
-/// it can mask real bugs (e.g. ghfs threads still holding the FS).
+/// When `lazy` is true (the default) we pass `-z` so the kernel detaches
+/// the mount from the namespace immediately and frees it once the last
+/// `cwd`/open handle goes away. The typical "busy" case is the user's
+/// own shell still `cd`'d into the mountpoint — lazy detach handles that
+/// transparently. `--strict` flips `lazy=false` for the case where the
+/// caller wants the busy error and the holder PIDs surfaced instead.
 pub fn run(path: PathBuf, lazy: bool) -> Result<()> {
     let canonical = path
         .canonicalize()
@@ -32,9 +34,8 @@ pub fn run(path: PathBuf, lazy: bool) -> Result<()> {
             bail!(
                 "{} is busy — another process has it open or `cd`'d into it.\n\
                  Find the holder with `fuser -vm {}` (or `lsof +f -- {}`), \
-                 or rerun with `ghfs unmount --lazy {}` to detach now and \
-                 free the mount when the last reference goes away.",
-                canonical.display(),
+                 or drop `--strict` to detach lazily and free the mount \
+                 when the last reference goes away.",
                 canonical.display(),
                 canonical.display(),
                 canonical.display(),

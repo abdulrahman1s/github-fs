@@ -277,24 +277,27 @@ always-available fallback.
 
 ### `ghfs unmount <path>`
 
-Wraps `fusermount3 -u <path>` so you don't have to remember the flag.
-Use it from a second shell when the mount process is held open by a
-shell currently `cd`'d into the mountpoint.
+Wraps `fusermount3 -uz <path>` (lazy unmount) so you don't have to
+remember the flag. The mount disappears from the namespace immediately;
+the kernel frees it once the last open handle or `cwd` reference goes
+away. Use it from a second shell when the mount process is held open by
+a shell currently `cd`'d into the mountpoint — the lazy default handles
+that case transparently.
 
 Flags:
 
 ```text
---lazy    Detach the mount immediately even if it is in use (maps to
-          `fusermount3 -uz`). The mount disappears from the namespace
-          right away and is fully freed once the last open handle or
-          `cwd` reference goes away. Not the default — silently lazy-
-          unmounting a busy mount can mask the fact that something
-          (often ghfs itself, or a stray shell) is still holding it.
+--strict  Refuse to detach when the mountpoint is busy. Maps to plain
+          `fusermount3 -u`. Use this when you specifically want a
+          busy-error and the holder PIDs surfaced (e.g. to debug a
+          stray process holding the mount) rather than the silent
+          lazy-detach the default offers.
 ```
 
-When the kernel returns *Device or resource busy*, `ghfs unmount` prints
-the PIDs to investigate (`fuser -vm <path>` / `lsof +f -- <path>`) and
-points at `--lazy` as the escape hatch.
+When `--strict` is set and the kernel returns *Device or resource busy*,
+`ghfs unmount` prints the PIDs to investigate (`fuser -vm <path>` /
+`lsof +f -- <path>`) and points at dropping `--strict` as the escape
+hatch.
 
 ### `ghfs status`
 

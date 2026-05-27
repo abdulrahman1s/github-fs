@@ -49,7 +49,7 @@ pub fn run(args: Args) -> Result<()> {
             foreground,
             cache_dir,
         ),
-        Command::Unmount { path, lazy } => cli::unmount::run(path, lazy),
+        Command::Unmount { path, strict } => cli::unmount::run(path, !strict),
         Command::Status => cli::status::run(),
         Command::Refresh { cache_dir } => {
             rt.block_on(cli::refresh::run(args.token, cfg, cache_dir))

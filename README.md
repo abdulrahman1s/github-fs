@@ -173,7 +173,7 @@ Token scopes: `repo` for private repos, none for public ones.
 | ------- | ------------ |
 | `ghfs whoami` | Print the authenticated GitHub user. Smoke-tests auth. |
 | `ghfs mount <path>` | Mount the GitHub filesystem at `<path>` (foreground). |
-| `ghfs unmount <path> [--lazy]` | Unmount via `fusermount3 -u`. Pass `--lazy` to detach a busy mount immediately. |
+| `ghfs unmount <path> [--strict]` | Unmount via `fusermount3 -uz` (lazy by default — detaches a busy mount and frees it once the last reference drops). Pass `--strict` to refuse on busy and surface the holder PIDs instead. |
 | `ghfs status` | List active ghfs mounts (scans `/proc/mounts`). |
 | `ghfs refresh` | Re-fetch the cached repo list. |
 | `ghfs info <path>` | Print repo metadata (URL, description, visibility, fork flag, default/effective branch) for the repo at `<path>` inside an active mount. |
