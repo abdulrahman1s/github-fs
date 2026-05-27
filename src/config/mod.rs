@@ -516,7 +516,11 @@ mod tests {
     #[test]
     fn auto_refresh_env_overrides_file() {
         let cf: ConfigFile = toml::from_str(r#"auto_refresh_interval_secs = 60"#).unwrap();
-        let cfg = resolve(cf, &env(&[("GHFS_AUTO_REFRESH_INTERVAL_SECS", "120")]), true);
+        let cfg = resolve(
+            cf,
+            &env(&[("GHFS_AUTO_REFRESH_INTERVAL_SECS", "120")]),
+            true,
+        );
         assert_eq!(cfg.auto_refresh_interval_secs, Some(120));
     }
 
@@ -530,7 +534,11 @@ mod tests {
     #[test]
     fn auto_refresh_env_unparseable_falls_back_to_file() {
         let cf: ConfigFile = toml::from_str(r#"auto_refresh_interval_secs = 90"#).unwrap();
-        let cfg = resolve(cf, &env(&[("GHFS_AUTO_REFRESH_INTERVAL_SECS", "nope")]), true);
+        let cfg = resolve(
+            cf,
+            &env(&[("GHFS_AUTO_REFRESH_INTERVAL_SECS", "nope")]),
+            true,
+        );
         assert_eq!(cfg.auto_refresh_interval_secs, Some(90));
     }
 

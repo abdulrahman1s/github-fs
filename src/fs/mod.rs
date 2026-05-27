@@ -491,7 +491,10 @@ impl Ghfs {
     /// of the relevant owner dir (subject to the dentry TTL).
     pub fn spawn_auto_refresh(&self, interval: Duration) {
         let handle = self.repo_refresh_handle();
-        info!(interval_secs = interval.as_secs(), "scheduling repo-list auto-refresh");
+        info!(
+            interval_secs = interval.as_secs(),
+            "scheduling repo-list auto-refresh"
+        );
         self.handle.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // `interval`'s first tick fires immediately; drop it so we
@@ -1524,10 +1527,7 @@ impl RepoRefreshHandle {
         .await?;
         let snapshot = Arc::new(RepoSnapshot::new(repos));
         let len = snapshot.len();
-        *self
-            .repo_cache
-            .write()
-            .expect("Ghfs.repo_cache poisoned") = Some(snapshot);
+        *self.repo_cache.write().expect("Ghfs.repo_cache poisoned") = Some(snapshot);
         Ok(len)
     }
 }

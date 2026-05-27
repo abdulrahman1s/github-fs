@@ -62,9 +62,19 @@ pub async fn run(
 
 #[derive(Debug, PartialEq, Eq)]
 enum NotifyEvent {
-    Notified { pid: i32, mount_path: String },
-    ReapedStale { pid: i32, mount_path: String },
-    SignalFailed { pid: i32, mount_path: String, error: String },
+    Notified {
+        pid: i32,
+        mount_path: String,
+    },
+    ReapedStale {
+        pid: i32,
+        mount_path: String,
+    },
+    SignalFailed {
+        pid: i32,
+        mount_path: String,
+        error: String,
+    },
 }
 
 /// SIGUSR1 every running mount whose pidfile lives under
