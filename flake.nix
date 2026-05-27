@@ -124,13 +124,20 @@
             runHook postInstall
           '';
 
-          # autoPatchelfHook runs in postFixup, so the binary isn't
-          # executable until after that — generate completions there.
-          postFixup = ''
+          # autoPatchelfHook registers itself in postFixupHooks, which
+          # runs *after* the user `postFixup` variable — so completions
+          # can't be generated in postFixup (the binary isn't patched
+          # yet). installCheckPhase runs after fixupPhase completes, by
+          # which point autoPatchelf has wired up the interpreter and
+          # rpath, so the binary is executable.
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
             installShellCompletion --cmd ${binName} \
               --bash <($out/bin/${binName} completions bash) \
               --zsh  <($out/bin/${binName} completions zsh) \
               --fish <($out/bin/${binName} completions fish)
+            runHook postInstallCheck
           '';
 
           meta = {
@@ -194,6 +201,11 @@
             # Help bindgen / build scripts find headers for libfuse3 and
             # openssl (the latter is pulled in by git2's `https` feature).
             PKG_CONFIG_PATH = "${pkgs.fuse3.dev}/lib/pkgconfig:${pkgs.openssl.dev}/lib/pkgconfig";
+
+            # rust-analyzer needs the std source to resolve `core`/`std`;
+            # nixpkgs' bare `rustc` doesn't ship it, so point r-a at the
+            # matching rustLibSrc derivation.
+            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
         }
       );
