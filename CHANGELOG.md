@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.1](https://github.com/abdulrahman1s/github-fs/compare/v0.5.0...v0.5.1) (2026-05-27)
+
+
+### Bug Fixes
+
+* walk parent_link for passthrough disk paths and raise NOFILE on mount ([1f9ce3e](https://github.com/abdulrahman1s/github-fs/commit/1f9ce3e78d83d5f016e78eb6a0627e61fe3b2518))
+
+
+### Performance
+
+* **fs:** cut redundant walks and allocations on the FUSE hot path ([4ecdd46](https://github.com/abdulrahman1s/github-fs/commit/4ecdd46c28ce09cde9bb6413dd532d6e2a767e79))
+
 ## [0.5.0](https://github.com/abdulrahman1s/github-fs/compare/v0.4.0...v0.5.0) (2026-05-27)
 
 
