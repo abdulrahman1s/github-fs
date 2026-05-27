@@ -29,7 +29,7 @@ directories = "5"
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
-fuser = { version = "0.15", features = ["abi-7-12"] }
+fuser = { version = "0.15", default-features = false, features = ["abi-7-12"] }
 libc = "0.2"
 git2 = { version = "0.19", default-features = false, features = ["https"] }
 

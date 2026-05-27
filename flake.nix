@@ -106,11 +106,13 @@
             pkgs.autoPatchelfHook
             pkgs.installShellFiles
           ];
-          # ghfs links against libssl/libcrypto via git2's https feature;
-          # autoPatchelfHook needs openssl on the host to wire them up.
+          # ghfs links against libssl/libcrypto via git2's https feature,
+          # and libz via libgit2; autoPatchelfHook needs all of them on
+          # the host to wire up the binary's RPATH.
           buildInputs = [
             pkgs.fuse3
             pkgs.openssl
+            pkgs.zlib
             pkgs.stdenv.cc.cc.lib
           ];
 

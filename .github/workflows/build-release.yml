@@ -240,6 +240,11 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # Native arm64 runner; cross-compiling glibc binaries from
+          # x86_64 needs a sysroot we don't want to maintain, and
+          # cross's QEMU path slows tests down ~5x.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
 
     steps:
       - name: Checkout
@@ -252,10 +257,10 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
-      - name: Install FUSE headers
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libfuse3-dev
+          sudo apt-get install -y --no-install-recommends pkg-config
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

@@ -118,14 +118,17 @@ mkdir -p ~/.local/bin
 install -m 0755 target/release/ghfs ~/.local/bin/ghfs
 ```
 
-You need libfuse3 and the kernel FUSE module on the host:
+You need the `fusermount3` helper and the kernel FUSE module on the
+host. `ghfs` no longer links against libfuse at build time — it drives
+the kernel FUSE protocol directly and shells out to `fusermount3` for
+the mount / unmount handshake — so the `*-dev` headers are not needed:
 
 | Distro | Package |
 | ------ | ------- |
-| Debian / Ubuntu | `fuse3 libfuse3-dev` |
-| Fedora / RHEL | `fuse3 fuse3-devel` |
+| Debian / Ubuntu | `fuse3` |
+| Fedora / RHEL | `fuse3` |
 | Arch | `fuse3` |
-| Alpine | `fuse3 fuse3-dev` |
+| Alpine | `fuse3` |
 | NixOS | use the bundled `shell.nix` / flake |
 
 If the kernel module isn't loaded:

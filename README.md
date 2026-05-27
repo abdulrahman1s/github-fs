@@ -108,7 +108,7 @@ cargo build --release
 install -m 0755 target/release/ghfs ~/.local/bin/ghfs
 ```
 
-You will also need libfuse3 and the kernel FUSE module. Debian/Ubuntu:
+You will also need `fusermount3` and the kernel FUSE module. Debian/Ubuntu:
 `sudo apt install fuse3`. Fedora/Arch/Alpine: package `fuse3`.
 
 <details>
