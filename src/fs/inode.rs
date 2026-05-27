@@ -212,18 +212,25 @@ impl InodeTable {
             return (ino, kind);
         }
 
-        let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
+        // Relaxed is sufficient: we just need a unique, monotonic ino. No
+        // other memory operation is ordered relative to this counter, so
+        // SeqCst would only add a global fence with no observable benefit.
+        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
         let kind = Arc::new(make());
         self.by_ino
             .write()
             .expect("InodeTable.by_ino poisoned")
             .insert(ino, kind.clone());
+        // Build the by_ino_link entry from `key` before consuming it for
+        // the by_path insert, so the miss path doesn't have to re-allocate
+        // the name string.
+        let link = (parent, key.1.clone());
         by_path.insert(key, ino);
         drop(by_path);
         self.by_ino_link
             .write()
             .expect("InodeTable.by_ino_link poisoned")
-            .insert(ino, (parent, name.to_string()));
+            .insert(ino, link);
         (ino, kind)
     }
 

@@ -45,6 +45,21 @@ const REPO_ENTRY_TTL: Duration = Duration::from_secs(1);
 /// `lookup`/`getattr` round-trip, making `stat`/`ls -la` show 0 bytes
 /// for ~60s after every `O_TRUNC` write. Force a re-ask on every stat.
 const ZERO_TTL: Duration = Duration::ZERO;
+/// How long a "this repo has no clone" answer stays cached before we
+/// re-stat `.git/HEAD`. Matched to `REPO_ENTRY_TTL` so the
+/// promote-pickup latency stays bounded by the kernel's repo dentry
+/// expiry. Positive answers are cached forever (clones don't disappear).
+const CLONE_NEGATIVE_TTL: Duration = Duration::from_secs(1);
+
+/// Memoized result of `CloneStore::has_clone(repo_id)`. The positive
+/// answer is sticky for the rest of the session; the negative answer
+/// expires after `CLONE_NEGATIVE_TTL` so the mount notices an
+/// out-of-band promote without a full remount.
+#[derive(Clone, Copy)]
+enum CloneState {
+    Cloned,
+    NotCloned { checked_at: Instant },
+}
 
 pub struct Ghfs {
     handle: Handle,
@@ -87,6 +102,15 @@ pub struct Ghfs {
     /// during this session — success or failure. Prevents re-trying every
     /// readdir/open after a clone failed.
     clone_attempted: RwLock<std::collections::HashSet<u64>>,
+    /// Memoized result of `CloneStore::has_clone` per repo_id. The naive
+    /// path stats `.git/HEAD` on every `attr_and_ttl` invocation, which
+    /// turns a `find` over a no-clone repo into N disk syscalls. Positive
+    /// answers are cached forever (clones don't disappear mid-session);
+    /// negatives are cached with a short TTL so an out-of-band `ghfs
+    /// promote` is still observed within ~`CLONE_NEGATIVE_TTL` — same
+    /// order as the kernel's `REPO_ENTRY_TTL`, so the user-visible
+    /// promote-pickup latency is unchanged.
+    clone_state: RwLock<HashMap<u64, CloneState>>,
     /// Single timestamp used for all file attrs in this mount session. GitHub's
     /// tree API doesn't surface per-blob mtimes, so giving everything the same
     /// (mount-time) timestamp is the cheapest sensible answer.
@@ -129,36 +153,36 @@ impl Ghfs {
             clone_fetch_depth,
             clone_remote_base,
             clone_attempted: RwLock::new(std::collections::HashSet::new()),
+            clone_state: RwLock::new(HashMap::new()),
             now: SystemTime::now(),
             uid,
             gid,
         }
     }
 
-    /// Stat-equivalent for a FUSE inode. Routes to the on-disk worktree
-    /// when one exists for this inode's branch (so size/mtime/perms reflect
-    /// real disk state), otherwise builds the virtual attr from the inode
-    /// kind's cached fields.
-    fn attr(&self, ino: u64, kind: &InodeKind) -> FileAttr {
-        if let Some(meta) = self.passthrough_metadata(ino) {
-            return build_attr_from_metadata(ino, &meta, self.uid, self.gid);
+    /// Combined attr + entry/attr-TTL for `(ino, kind)`. Folds what would
+    /// otherwise be two independent parent_link walks (one for the attr,
+    /// one for the TTL) into a single walk — every FUSE op that hands the
+    /// kernel back an `(attr, ttl)` pair calls this, and a deeply nested
+    /// file inside a materialized worktree pays the walk cost twice in
+    /// the naive version. Returns the attr from real on-disk metadata
+    /// when the inode resolves through a materialized worktree;
+    /// otherwise from the inode's cached virtual fields.
+    fn attr_and_ttl(&self, ino: u64, kind: &InodeKind) -> (FileAttr, &'static Duration) {
+        if let Some(disk) = self.passthrough_disk_path(ino) {
+            // Passthrough resolves: any metadata read failure still keeps
+            // us on the disk-backed side, which forces ZERO_TTL so the
+            // kernel re-asks rather than caching a stale virtual attr.
+            let attr = match std::fs::symlink_metadata(&disk) {
+                Ok(m) => build_attr_from_metadata(ino, &m, self.uid, self.gid),
+                Err(_) => build_attr(ino, kind, self.now, self.uid, self.gid),
+            };
+            return (attr, &ZERO_TTL);
         }
-        build_attr(ino, kind, self.now, self.uid, self.gid)
-    }
-
-    /// TTL to attach to attrs/entries we hand back to the kernel.
-    /// Mirrors `ttl_for_kind` for virtual inodes, but forces `ZERO_TTL`
-    /// whenever the inode resolves through a materialized worktree:
-    /// writes via the mount, `git`-side mutations, and external edits
-    /// against the on-disk worktree all bypass the kernel's attr cache,
-    /// so we can't safely cache disk-backed size/mtime/perm at all. The
-    /// extra getattr round-trip per stat is cheap; the alternative is
-    /// `stat` returning a 0-byte size for ~60s after every `O_TRUNC`.
-    fn ttl_for_attr(&self, ino: u64, kind: &InodeKind) -> &'static Duration {
-        if self.passthrough_disk_path(ino).is_some() {
-            return &ZERO_TTL;
-        }
-        ttl_for_kind(kind)
+        (
+            build_attr(ino, kind, self.now, self.uid, self.gid),
+            ttl_for_kind(kind),
+        )
     }
 
     /// Return the absolute path of the on-disk clone for `repo` iff one has
@@ -174,9 +198,35 @@ impl Ghfs {
     /// user has currently checked out in the working tree.
     fn clone_root_for(&self, repo: &RepoRef) -> Option<std::path::PathBuf> {
         let store = self.clone_store.as_ref()?;
-        if store.has_clone(&repo.owner, &repo.name) {
+        // Fast path: consult the memoized clone-state cache. Positive
+        // entries are sticky; negatives expire so promotes are picked up.
+        {
+            let cache = self.clone_state.read().expect("Ghfs.clone_state poisoned");
+            match cache.get(&repo.repo_id) {
+                Some(CloneState::Cloned) => {
+                    return Some(store.repo_path(&repo.owner, &repo.name));
+                }
+                Some(CloneState::NotCloned { checked_at })
+                    if checked_at.elapsed() < CLONE_NEGATIVE_TTL =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        // Cache miss or stale negative — hit disk and update the cache.
+        let cloned = store.has_clone(&repo.owner, &repo.name);
+        let mut cache = self.clone_state.write().expect("Ghfs.clone_state poisoned");
+        if cloned {
+            cache.insert(repo.repo_id, CloneState::Cloned);
             Some(store.repo_path(&repo.owner, &repo.name))
         } else {
+            cache.insert(
+                repo.repo_id,
+                CloneState::NotCloned {
+                    checked_at: Instant::now(),
+                },
+            );
             None
         }
     }
@@ -194,7 +244,9 @@ impl Ghfs {
     /// resolution correct for the renamed inode AND for any inode
     /// underneath it (whose own names don't change on a parent rename).
     fn branch_relative_path(&self, ino: u64) -> Option<(RepoRef, String, String)> {
-        let mut names: Vec<String> = Vec::new();
+        // Pre-size for a typical repo depth so the walk doesn't reallocate
+        // for nested files.
+        let mut names: Vec<String> = Vec::with_capacity(8);
         let mut cur = ino;
         loop {
             let kind = self.inodes.get(cur)?;
@@ -206,8 +258,18 @@ impl Ghfs {
                     let rel = if names.is_empty() {
                         String::new()
                     } else {
-                        names.reverse();
-                        names.join("/")
+                        // Compute the final length up-front so the joined
+                        // String allocates exactly once.
+                        let total: usize =
+                            names.iter().map(String::len).sum::<usize>() + names.len() - 1;
+                        let mut rel = String::with_capacity(total);
+                        for (i, name) in names.iter().rev().enumerate() {
+                            if i > 0 {
+                                rel.push('/');
+                            }
+                            rel.push_str(name);
+                        }
+                        rel
                     };
                     return Some((repo.clone(), branch.clone(), rel));
                 }
@@ -225,15 +287,74 @@ impl Ghfs {
     /// clone. Used by every op that wants to read/list/open the real thing
     /// instead of the virtual GitHub view.
     fn passthrough_disk_path(&self, ino: u64) -> Option<std::path::PathBuf> {
-        let (repo, _branch, rel) = self.branch_relative_path(ino)?;
-        let root = self.clone_root_for(&repo)?;
-        Some(if rel.is_empty() { root } else { root.join(rel) })
-    }
-
-    /// `symlink_metadata` against the passthrough disk path, if one exists.
-    fn passthrough_metadata(&self, ino: u64) -> Option<std::fs::Metadata> {
-        let disk = self.passthrough_disk_path(ino)?;
-        std::fs::symlink_metadata(&disk).ok()
+        // Walk inline so we don't allocate the throwaway `branch` string
+        // or clone the `RepoRef`'s owner/name pair that
+        // `branch_relative_path` would build — the hot `attr_and_ttl` call
+        // only needs the disk path.
+        let store = self.clone_store.as_ref()?;
+        let mut names: Vec<String> = Vec::with_capacity(8);
+        let mut cur = ino;
+        loop {
+            let kind = self.inodes.get(cur)?;
+            match &*kind {
+                InodeKind::Repo { repo, branch } => {
+                    if branch.is_empty() {
+                        return None;
+                    }
+                    // Reuse the cached clone-state check so we don't stat
+                    // `.git/HEAD` per inode during a `find`.
+                    let cache = self.clone_state.read().expect("Ghfs.clone_state poisoned");
+                    let cached = cache.get(&repo.repo_id).copied();
+                    drop(cache);
+                    let root = match cached {
+                        Some(CloneState::Cloned) => store.repo_path(&repo.owner, &repo.name),
+                        Some(CloneState::NotCloned { checked_at })
+                            if checked_at.elapsed() < CLONE_NEGATIVE_TTL =>
+                        {
+                            return None;
+                        }
+                        _ => {
+                            let cloned = store.has_clone(&repo.owner, &repo.name);
+                            let mut cache =
+                                self.clone_state.write().expect("Ghfs.clone_state poisoned");
+                            if cloned {
+                                cache.insert(repo.repo_id, CloneState::Cloned);
+                                store.repo_path(&repo.owner, &repo.name)
+                            } else {
+                                cache.insert(
+                                    repo.repo_id,
+                                    CloneState::NotCloned {
+                                        checked_at: Instant::now(),
+                                    },
+                                );
+                                return None;
+                            }
+                        }
+                    };
+                    if names.is_empty() {
+                        return Some(root);
+                    }
+                    // Build the joined relative path with a single
+                    // pre-sized allocation, then push it onto `root`.
+                    let total: usize =
+                        names.iter().map(String::len).sum::<usize>() + names.len() - 1;
+                    let mut rel = String::with_capacity(total);
+                    for (i, name) in names.iter().rev().enumerate() {
+                        if i > 0 {
+                            rel.push('/');
+                        }
+                        rel.push_str(name);
+                    }
+                    return Some(root.join(rel));
+                }
+                InodeKind::Root | InodeKind::Owner { .. } => return None,
+                _ => {
+                    let (parent, name) = self.inodes.parent_link(cur)?;
+                    names.push(name);
+                    cur = parent;
+                }
+            }
+        }
     }
 
     /// Allocate (or reuse) an inode for a real on-disk entry under a
@@ -251,25 +372,29 @@ impl Ghfs {
         parent_rel: &str,
         metadata: &std::fs::Metadata,
     ) -> (u64, Arc<InodeKind>) {
-        let full_path = if parent_rel.is_empty() {
-            name.to_string()
-        } else {
-            format!("{parent_rel}/{name}")
-        };
+        // `full_path` is constructed lazily inside the closure — the cache
+        // hit path returns before the closure runs, so eagerly formatting
+        // would burn an allocation per readdir entry on the steady-state
+        // path.
         self.inodes.lookup_or_create(parent_ino, name, || {
+            let full_path = if parent_rel.is_empty() {
+                name.to_string()
+            } else {
+                format!("{parent_rel}/{name}")
+            };
             let ft = metadata.file_type();
             if ft.is_dir() {
                 InodeKind::Dir {
                     repo: repo.clone(),
                     branch: branch.to_string(),
                     repo_tree_sha: String::new(),
-                    path: full_path.clone(),
+                    path: full_path,
                 }
             } else if ft.is_symlink() {
                 InodeKind::Symlink {
                     repo: repo.clone(),
                     branch: branch.to_string(),
-                    path: full_path.clone(),
+                    path: full_path,
                     blob_sha: String::new(),
                     size: metadata.len(),
                 }
@@ -279,7 +404,7 @@ impl Ghfs {
                 InodeKind::File {
                     repo: repo.clone(),
                     branch: branch.to_string(),
-                    path: full_path.clone(),
+                    path: full_path,
                     blob_sha: String::new(),
                     size: metadata.len(),
                     executable,
@@ -323,8 +448,16 @@ impl Ghfs {
     /// inode does not sit under a materialized worktree, which is the
     /// signal write ops use to short-circuit with `EROFS`.
     fn passthrough_ctx(&self, ino: u64) -> Option<(std::path::PathBuf, RepoRef, String, String)> {
+        // Build the disk path directly from the walk result instead of
+        // calling `passthrough_disk_path` (which would redo the
+        // parent_link walk we already paid for).
         let (repo, branch, rel) = self.branch_relative_path(ino)?;
-        let disk = self.passthrough_disk_path(ino)?;
+        let root = self.clone_root_for(&repo)?;
+        let disk = if rel.is_empty() {
+            root
+        } else {
+            root.join(&rel)
+        };
         Some((disk, repo, branch, rel))
     }
 
@@ -833,6 +966,14 @@ impl Ghfs {
             return;
         }
         info!(repo = %repo.name, branch, "clone ready");
+        // Mark the clone state positive so subsequent `passthrough_*`
+        // calls skip the `.git/HEAD` stat. Stays sticky for the rest of
+        // the session — the directory is on disk now and isn't going
+        // away without us knowing.
+        self.clone_state
+            .write()
+            .expect("Ghfs.clone_state poisoned")
+            .insert(repo.repo_id, CloneState::Cloned);
         // Clone is now on disk. Seed branch_heads from the local object DB
         // so the rest of the session avoids the GitHub API for this branch's
         // tree resolution. The FS layer routes ops to the working tree
@@ -906,30 +1047,35 @@ impl Ghfs {
         parent: TreeEntryParent<'_>,
         e: &TreeEntry,
     ) -> (u64, Arc<InodeKind>) {
-        let full_path = if parent.path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{name}", parent.path)
-        };
-        self.inodes
-            .lookup_or_create(parent.ino, name, || match e.kind {
+        // `full_path` is built lazily inside the closure: on a cache hit
+        // (the common case during readdir) the closure never runs, so the
+        // formatting allocation is skipped entirely. Branches take
+        // ownership of `full_path` directly — only one variant constructs
+        // the inode per call.
+        self.inodes.lookup_or_create(parent.ino, name, || {
+            let full_path = if parent.path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{name}", parent.path)
+            };
+            match e.kind {
                 TreeEntryKind::Tree => InodeKind::Dir {
                     repo: parent.repo.clone(),
                     branch: parent.branch.to_string(),
                     repo_tree_sha: parent.tree_sha.to_string(),
-                    path: full_path.clone(),
+                    path: full_path,
                 },
                 TreeEntryKind::Blob if is_symlink_mode(&e.mode) => InodeKind::Symlink {
                     repo: parent.repo.clone(),
                     branch: parent.branch.to_string(),
-                    path: full_path.clone(),
+                    path: full_path,
                     blob_sha: e.sha.clone(),
                     size: e.size.unwrap_or(0),
                 },
                 TreeEntryKind::Blob => InodeKind::File {
                     repo: parent.repo.clone(),
                     branch: parent.branch.to_string(),
-                    path: full_path.clone(),
+                    path: full_path,
                     blob_sha: e.sha.clone(),
                     size: e.size.unwrap_or(0),
                     executable: is_executable_mode(&e.mode),
@@ -937,9 +1083,10 @@ impl Ghfs {
                 TreeEntryKind::Commit => InodeKind::Submodule {
                     repo: parent.repo.clone(),
                     branch: parent.branch.to_string(),
-                    path: full_path.clone(),
+                    path: full_path,
                 },
-            })
+            }
+        })
     }
 
     // ---- op helpers ----
@@ -960,9 +1107,13 @@ impl Ghfs {
                 if !repos.has_owner(name) {
                     return Ok(None);
                 }
-                let owner_login = name.to_string();
+                // Owner-login allocation is deferred to the closure so a
+                // cache hit (the steady state during heavy traversal)
+                // doesn't pay for an unused String.
                 Ok(Some(self.inodes.lookup_or_create(parent_ino, name, || {
-                    InodeKind::Owner { login: owner_login }
+                    InodeKind::Owner {
+                        login: name.to_string(),
+                    }
                 })))
             }
             InodeKind::Owner { login } => {
@@ -975,27 +1126,35 @@ impl Ghfs {
                 let Some(repo) = repos.get(login, name) else {
                     return Ok(None);
                 };
-                let rref = RepoRef {
-                    repo_id: repo.id,
-                    owner: repo.owner.login.clone(),
-                    name: repo.name.clone(),
-                };
-                let branch =
-                    self.effective_branch_for(rref.repo_id, repo.default_branch.as_deref());
-                // `on_access` trigger: synchronously materialize on first
-                // lookup so subsequent ops on this repo pass through to
-                // the real worktree. The repo inode itself is allocated
-                // unconditionally — no kind flip, so cwd inside the repo
-                // dir survives the transition.
-                if matches!(self.clone_trigger, CloneTrigger::OnAccess) && !branch.is_empty() {
-                    self.try_clone_repo(&rref, &branch);
+                // `on_access` trigger needs the RepoRef + effective branch
+                // eagerly to invoke `try_clone_repo`; other triggers don't,
+                // so defer both the RepoRef construction and the sqlite
+                // `effective_branch_for` lookup into the inode-creation
+                // closure where they only fire on the first allocation.
+                let on_access = matches!(self.clone_trigger, CloneTrigger::OnAccess);
+                if on_access {
+                    let rref = RepoRef {
+                        repo_id: repo.id,
+                        owner: repo.owner.login.clone(),
+                        name: repo.name.clone(),
+                    };
+                    let branch =
+                        self.effective_branch_for(rref.repo_id, repo.default_branch.as_deref());
+                    if !branch.is_empty() {
+                        self.try_clone_repo(&rref, &branch);
+                    }
+                    return Ok(Some(self.inodes.lookup_or_create(parent_ino, name, || {
+                        InodeKind::Repo { repo: rref, branch }
+                    })));
                 }
-                let rref_for_make = rref.clone();
-                let branch_for_make = branch.clone();
                 Ok(Some(self.inodes.lookup_or_create(parent_ino, name, || {
                     InodeKind::Repo {
-                        repo: rref_for_make,
-                        branch: branch_for_make,
+                        repo: RepoRef {
+                            repo_id: repo.id,
+                            owner: repo.owner.login.clone(),
+                            name: repo.name.clone(),
+                        },
+                        branch: self.effective_branch_for(repo.id, repo.default_branch.as_deref()),
                     }
                 })))
             }
@@ -1098,11 +1257,13 @@ impl Ghfs {
                     .owners()
                     .map(|login| {
                         let name = login.to_string();
-                        let login_for_make = name.clone();
+                        // Closure body only fires on cache miss; the steady
+                        // state readdir is all hits, so no per-entry login
+                        // allocation gets thrown away.
                         let (ino, kind) =
                             self.inodes
                                 .lookup_or_create(parent_ino, &name, || InodeKind::Owner {
-                                    login: login_for_make,
+                                    login: name.clone(),
                                 });
                         DirChild { ino, kind, name }
                     })
@@ -1113,21 +1274,21 @@ impl Ghfs {
                 Ok(repos
                     .repos_for_owner(login)
                     .map(|r| {
-                        let rref = RepoRef {
-                            repo_id: r.id,
-                            owner: r.owner.login.clone(),
-                            name: r.name.clone(),
-                        };
                         let name = r.name.clone();
-                        let branch =
-                            self.effective_branch_for(rref.repo_id, r.default_branch.as_deref());
-                        let rref_for_make = rref.clone();
-                        let branch_for_make = branch.clone();
+                        // RepoRef construction and the `effective_branch_for`
+                        // sqlite lookup are both deferred to the closure: a
+                        // 500-repo `ls` over a warm session pays zero clones
+                        // and zero sqlite queries on the hit path.
                         let (ino, kind) =
                             self.inodes
                                 .lookup_or_create(parent_ino, &name, || InodeKind::Repo {
-                                    repo: rref_for_make,
-                                    branch: branch_for_make,
+                                    repo: RepoRef {
+                                        repo_id: r.id,
+                                        owner: r.owner.login.clone(),
+                                        name: r.name.clone(),
+                                    },
+                                    branch: self
+                                        .effective_branch_for(r.id, r.default_branch.as_deref()),
                                 });
                         DirChild { ino, kind, name }
                     })
@@ -1670,40 +1831,53 @@ impl RepoRefreshHandle {
 
 struct RepoSnapshot {
     repos: Vec<Repo>,
-    by_owner_name: HashMap<(String, String), Repo>,
+    /// Two-level index keyed by `&str` so neither `get` nor `has_owner`
+    /// has to allocate a `String` to probe. The inner map preserves the
+    /// `Repo` records as cloned values so callers can return `&Repo`
+    /// references that outlive the lookup.
+    by_owner: HashMap<String, OwnerEntry>,
     /// Owner logins in first-seen order so `ls <mount>` is deterministic.
-    /// Membership only depends on what's in `repos`; duplicates are dropped
-    /// at construction time.
     owners: Vec<String>,
+}
+
+struct OwnerEntry {
+    /// Repos for this owner, in iteration order from the original list.
+    /// Indexed by `Repo::name` for O(1) `repos.get(owner, name)`.
+    repos: Vec<Repo>,
+    by_name: HashMap<String, usize>,
 }
 
 impl RepoSnapshot {
     fn new(repos: Vec<Repo>) -> Self {
-        let by_owner_name = repos
-            .iter()
-            .map(|repo| ((repo.owner.login.clone(), repo.name.clone()), repo.clone()))
-            .collect();
-        let mut owners = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut by_owner: HashMap<String, OwnerEntry> = HashMap::new();
+        let mut owners: Vec<String> = Vec::new();
         for repo in &repos {
-            if seen.insert(repo.owner.login.clone()) {
+            let entry = by_owner.entry(repo.owner.login.clone()).or_insert_with(|| {
                 owners.push(repo.owner.login.clone());
-            }
+                OwnerEntry {
+                    repos: Vec::new(),
+                    by_name: HashMap::new(),
+                }
+            });
+            let idx = entry.repos.len();
+            entry.by_name.insert(repo.name.clone(), idx);
+            entry.repos.push(repo.clone());
         }
         Self {
             repos,
-            by_owner_name,
+            by_owner,
             owners,
         }
     }
 
     fn get(&self, owner: &str, name: &str) -> Option<&Repo> {
-        self.by_owner_name
-            .get(&(owner.to_string(), name.to_string()))
+        let entry = self.by_owner.get(owner)?;
+        let idx = entry.by_name.get(name)?;
+        Some(&entry.repos[*idx])
     }
 
     fn has_owner(&self, owner: &str) -> bool {
-        self.owners.iter().any(|o| o == owner)
+        self.by_owner.contains_key(owner)
     }
 
     fn owners(&self) -> impl Iterator<Item = &str> {
@@ -1711,7 +1885,13 @@ impl RepoSnapshot {
     }
 
     fn repos_for_owner<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = &'a Repo> {
-        self.repos.iter().filter(move |r| r.owner.login == owner)
+        // O(repos-for-this-owner) instead of O(all-repos) — matters on
+        // accounts with thousands of repos spread across a handful of
+        // owners.
+        self.by_owner
+            .get(owner)
+            .into_iter()
+            .flat_map(|entry| entry.repos.iter())
     }
 
     fn iter(&self) -> impl Iterator<Item = &Repo> {
@@ -1784,7 +1964,7 @@ fn is_local_git_metadata_probe(name: &str) -> bool {
 /// swings the FS into passthrough mode for the rest of the tree. Other
 /// entry kinds keep the longer `TTL`.
 ///
-/// Prefer `Ghfs::ttl_for_attr` when an `ino` is available: it can detect
+/// Prefer `Ghfs::attr_and_ttl` when an `ino` is available: it can detect
 /// passthrough resolution and force `ZERO_TTL` so the kernel doesn't
 /// cache disk-backed attrs through out-of-band writes.
 fn ttl_for_kind(kind: &InodeKind) -> &'static Duration {
@@ -1929,16 +2109,28 @@ impl Filesystem for Ghfs {
             reply.error(libc::ENOENT);
             return;
         };
-        let path = self.path_for_child(&parent_kind, name);
-        debug!(parent, name, path = %path, parent_kind = kind_name(&parent_kind), "lookup");
+        // Gate `path` formatting behind the debug filter — `path_for_child`
+        // builds a `String` and is hot on directory traversals; the tracing
+        // field expression would otherwise evaluate even when debug is off.
+        let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        if debug_enabled {
+            let path = self.path_for_child(&parent_kind, name);
+            debug!(parent, name, path = %path, parent_kind = kind_name(&parent_kind), "lookup");
+        }
         match self.do_lookup(parent, &parent_kind, name) {
             Ok(Some((ino, kind))) => {
-                debug!(ino, path = %path, kind = kind_name(&kind), "lookup hit");
-                let attr = self.attr(ino, &kind);
-                reply.entry(self.ttl_for_attr(ino, &kind), &attr, 0);
+                if debug_enabled {
+                    let path = self.path_for_child(&parent_kind, name);
+                    debug!(ino, path = %path, kind = kind_name(&kind), "lookup hit");
+                }
+                let (attr, ttl) = self.attr_and_ttl(ino, &kind);
+                reply.entry(ttl, &attr, 0);
             }
             Ok(None) => {
-                debug!(path = %path, "lookup miss");
+                if debug_enabled {
+                    let path = self.path_for_child(&parent_kind, name);
+                    debug!(path = %path, "lookup miss");
+                }
                 reply.error(libc::ENOENT);
             }
             Err(e) => {
@@ -1952,14 +2144,16 @@ impl Filesystem for Ghfs {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.inodes.get(ino) {
             Some(kind) => {
-                debug!(
-                    ino,
-                    path = %path_for_kind(&kind),
-                    kind = kind_name(&kind),
-                    "getattr"
-                );
-                let attr = self.attr(ino, &kind);
-                reply.attr(self.ttl_for_attr(ino, &kind), &attr);
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        ino,
+                        path = %path_for_kind(&kind),
+                        kind = kind_name(&kind),
+                        "getattr"
+                    );
+                }
+                let (attr, ttl) = self.attr_and_ttl(ino, &kind);
+                reply.attr(ttl, &attr);
             }
             None => {
                 debug!(ino, "getattr missing");
@@ -2008,11 +2202,8 @@ impl Filesystem for Ghfs {
             reply.error(libc::ENOENT);
             return;
         };
-        let path = path_for_kind(&kind);
-        if offset == 0 {
-            info!(ino, path = %path, kind = kind_name(&kind), "listing directory");
-        } else {
-            debug!(ino, offset, path = %path, kind = kind_name(&kind), "readdir");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(ino, offset, path = %path_for_kind(&kind), kind = kind_name(&kind), "readdir");
         }
 
         if !matches!(
@@ -2027,11 +2218,25 @@ impl Filesystem for Ghfs {
             return;
         }
 
-        let children = match self.collect_children(ino, &kind) {
-            Ok(c) => {
-                debug!(ino, path = %path, children = c.len(), "readdir children");
-                c
+        let start = offset as usize;
+        // Emit "." / ".." synthetically without allocating DirChild slots
+        // for them. We point ".." at the same `ino` because the kernel does
+        // its own parent resolution via lookup() when it actually needs it.
+        if start < 2 {
+            if start == 0 && reply.add(ino, 1, kind_to_filetype(&kind), ".") {
+                reply.ok();
+                return;
             }
+            if start <= 1 && reply.add(ino, 2, kind_to_filetype(&kind), "..") {
+                reply.ok();
+                return;
+            }
+        }
+
+        // Only enumerate real children once we know the kernel still wants
+        // entries past the synthetic ones.
+        let children = match self.collect_children(ino, &kind) {
+            Ok(c) => c,
             Err(e) => {
                 let errno = e.to_errno();
                 error!(ino, error = %e, errno, "readdir failed");
@@ -2039,32 +2244,17 @@ impl Filesystem for Ghfs {
                 return;
             }
         };
-
-        // Synthesise "." and "..". We pass `ino` for ".." too: the kernel does
-        // its own parent resolution via lookup() when it actually needs it.
-        let mut all: Vec<DirChild> = Vec::with_capacity(children.len() + 2);
-        all.push(DirChild {
-            ino,
-            kind: kind.clone(),
-            name: ".".to_string(),
-        });
-        all.push(DirChild {
-            ino,
-            kind: kind.clone(),
-            name: "..".to_string(),
-        });
-        all.extend(children);
-
-        let start = offset as usize;
-        for (i, child) in all.iter().enumerate().skip(start) {
-            // The kernel will pass i+1 back as the next offset.
+        let child_start = start.saturating_sub(2);
+        for (i, child) in children.iter().enumerate().skip(child_start) {
+            // i+2 accounts for the two synthetic entries that came first;
+            // the kernel passes the next offset back to us as-is.
             if reply.add(
                 child.ino,
-                (i + 1) as i64,
+                (i + 3) as i64,
                 kind_to_filetype(&child.kind),
                 &child.name,
             ) {
-                break; // reply buffer full
+                break;
             }
         }
         reply.ok();
@@ -2083,11 +2273,8 @@ impl Filesystem for Ghfs {
             reply.error(libc::ENOENT);
             return;
         };
-        let path = path_for_kind(&kind);
-        if offset == 0 {
-            info!(ino, path = %path, kind = kind_name(&kind), "listing directory");
-        } else {
-            debug!(ino, offset, path = %path, kind = kind_name(&kind), "readdirplus");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(ino, offset, path = %path_for_kind(&kind), kind = kind_name(&kind), "readdirplus");
         }
 
         if !matches!(
@@ -2102,11 +2289,23 @@ impl Filesystem for Ghfs {
             return;
         }
 
-        let children = match self.collect_children(ino, &kind) {
-            Ok(c) => {
-                debug!(ino, path = %path, children = c.len(), "readdirplus children");
-                c
+        let start = offset as usize;
+        if start < 2 {
+            // Both "." and ".." carry the directory's own (attr, ttl); we
+            // resolve it once and reuse for both.
+            let (self_attr, self_ttl) = self.attr_and_ttl(ino, &kind);
+            if start == 0 && reply.add(ino, 1, ".", self_ttl, &self_attr, 0) {
+                reply.ok();
+                return;
             }
+            if start <= 1 && reply.add(ino, 2, "..", self_ttl, &self_attr, 0) {
+                reply.ok();
+                return;
+            }
+        }
+
+        let children = match self.collect_children(ino, &kind) {
+            Ok(c) => c,
             Err(e) => {
                 let errno = e.to_errno();
                 error!(ino, error = %e, errno, "readdirplus failed");
@@ -2114,31 +2313,10 @@ impl Filesystem for Ghfs {
                 return;
             }
         };
-
-        let mut all: Vec<DirChild> = Vec::with_capacity(children.len() + 2);
-        all.push(DirChild {
-            ino,
-            kind: kind.clone(),
-            name: ".".to_string(),
-        });
-        all.push(DirChild {
-            ino,
-            kind: kind.clone(),
-            name: "..".to_string(),
-        });
-        all.extend(children);
-
-        let start = offset as usize;
-        for (i, child) in all.iter().enumerate().skip(start) {
-            let attr = self.attr(child.ino, &child.kind);
-            if reply.add(
-                child.ino,
-                (i + 1) as i64,
-                &child.name,
-                self.ttl_for_attr(child.ino, &child.kind),
-                &attr,
-                0,
-            ) {
+        let child_start = start.saturating_sub(2);
+        for (i, child) in children.iter().enumerate().skip(child_start) {
+            let (attr, ttl) = self.attr_and_ttl(child.ino, &child.kind);
+            if reply.add(child.ino, (i + 3) as i64, &child.name, ttl, &attr, 0) {
                 break;
             }
         }
@@ -2151,7 +2329,7 @@ impl Filesystem for Ghfs {
             reply.error(libc::ENOENT);
             return;
         };
-        info!(
+        debug!(
             ino,
             flags,
             path = %path_for_kind(&kind),
@@ -2417,7 +2595,7 @@ impl Filesystem for Ghfs {
             return;
         };
         let child_disk = parent_disk.join(name_str);
-        info!(parent, name = name_str, path = %child_disk.display(), "create");
+        debug!(parent, name = name_str, path = %child_disk.display(), "create");
 
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
@@ -2450,11 +2628,14 @@ impl Filesystem for Ghfs {
                 return;
             }
         };
-        let (ino, kind) =
+        let (ino, _kind) =
             self.passthrough_allocate(parent, name_str, &repo, &branch, &parent_rel, &metadata);
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
         let fh = self.open_files.insert(file);
-        reply.created(self.ttl_for_attr(ino, &kind), &attr, 0, fh, 0);
+        // We just resolved through `passthrough_ctx`, so the inode is
+        // disk-backed and TTL is unconditionally `ZERO_TTL` — skip the
+        // redundant passthrough walk that `attr_and_ttl` would do.
+        reply.created(&ZERO_TTL, &attr, 0, fh, 0);
     }
 
     fn write(
@@ -2511,8 +2692,8 @@ impl Filesystem for Ghfs {
         if !want_mutation {
             // Pure stat. The kernel can issue setattr with no fields set
             // as a getattr-equivalent; return current attrs.
-            let attr = self.attr(ino, &kind);
-            reply.attr(self.ttl_for_attr(ino, &kind), &attr);
+            let (attr, ttl) = self.attr_and_ttl(ino, &kind);
+            reply.attr(ttl, &attr);
             return;
         }
 
@@ -2604,7 +2785,8 @@ impl Filesystem for Ghfs {
             }
         };
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
-        reply.attr(self.ttl_for_attr(ino, &kind), &attr);
+        // Disk-backed inode after a mutating setattr — ZERO_TTL by definition.
+        reply.attr(&ZERO_TTL, &attr);
     }
 
     fn mkdir(
@@ -2625,7 +2807,7 @@ impl Filesystem for Ghfs {
             return;
         };
         let child_disk = parent_disk.join(name_str);
-        info!(parent, name = name_str, path = %child_disk.display(), "mkdir");
+        debug!(parent, name = name_str, path = %child_disk.display(), "mkdir");
 
         if let Err(e) = std::fs::create_dir(&child_disk) {
             error!(?e, path = %child_disk.display(), "mkdir failed");
@@ -2655,10 +2837,11 @@ impl Filesystem for Ghfs {
                 return;
             }
         };
-        let (ino, kind) =
+        let (ino, _kind) =
             self.passthrough_allocate(parent, name_str, &repo, &branch, &parent_rel, &metadata);
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
-        reply.entry(self.ttl_for_attr(ino, &kind), &attr, 0);
+        // Disk-backed inode under a materialized worktree — ZERO_TTL.
+        reply.entry(&ZERO_TTL, &attr, 0);
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -2671,7 +2854,7 @@ impl Filesystem for Ghfs {
             return;
         };
         let target = parent_disk.join(name_str);
-        info!(parent, name = name_str, path = %target.display(), "unlink");
+        debug!(parent, name = name_str, path = %target.display(), "unlink");
 
         match std::fs::remove_file(&target) {
             Ok(()) => {
@@ -2699,7 +2882,7 @@ impl Filesystem for Ghfs {
             return;
         };
         let target = parent_disk.join(name_str);
-        info!(parent, name = name_str, path = %target.display(), "rmdir");
+        debug!(parent, name = name_str, path = %target.display(), "rmdir");
 
         match std::fs::remove_dir(&target) {
             Ok(()) => {
@@ -2744,7 +2927,7 @@ impl Filesystem for Ghfs {
         }
         let src = old_parent_disk.join(name_str);
         let dst = new_parent_disk.join(newname_str);
-        info!(src = %src.display(), dst = %dst.display(), "rename");
+        debug!(src = %src.display(), dst = %dst.display(), "rename");
 
         match std::fs::rename(&src, &dst) {
             Ok(()) => {
@@ -2790,7 +2973,7 @@ impl Filesystem for Ghfs {
             return;
         };
         let link_disk = parent_disk.join(name_str);
-        info!(parent, name = name_str, target = %target.display(), "symlink");
+        debug!(parent, name = name_str, target = %target.display(), "symlink");
 
         if let Err(e) = std::os::unix::fs::symlink(target, &link_disk) {
             error!(?e, link = %link_disk.display(), "symlink failed");
@@ -2804,10 +2987,11 @@ impl Filesystem for Ghfs {
                 return;
             }
         };
-        let (ino, kind) =
+        let (ino, _kind) =
             self.passthrough_allocate(parent, name_str, &repo, &branch, &parent_rel, &metadata);
         let attr = build_attr_from_metadata(ino, &metadata, self.uid, self.gid);
-        reply.entry(self.ttl_for_attr(ino, &kind), &attr, 0);
+        // Disk-backed inode under a materialized worktree — ZERO_TTL.
+        reply.entry(&ZERO_TTL, &attr, 0);
     }
 
     fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
@@ -3115,6 +3299,11 @@ mod passthrough_tests {
         );
 
         let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
+        // In production the negative cache expires after `CLONE_NEGATIVE_TTL`
+        // (matched to the kernel's repo dentry TTL) — out-of-band promotes
+        // are picked up within that bound. The test exercises immediate
+        // detection by clearing the cached negative.
+        fs.clone_state.write().unwrap().clear();
         assert_eq!(fs.clone_root_for(&repo), Some(wt));
     }
 

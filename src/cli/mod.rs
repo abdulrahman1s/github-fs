@@ -139,9 +139,15 @@ pub fn init_tracing(level: Option<&str>) {
         .or_else(|| EnvFilter::try_from_default_env().ok())
         .unwrap_or_else(|| EnvFilter::new("ghfs=info,warn"));
 
-    let _ = tracing_subscriber::fmt()
+    let initialized = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
-        .try_init();
+        .try_init()
+        .is_ok();
+    if initialized {
+        // Emit the build version once per process so log captures from
+        // crashed mounts / CI runs are unambiguously tied to a release.
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "ghfs starting");
+    }
 }
