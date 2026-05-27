@@ -180,6 +180,53 @@ Rules of thumb:
 When the docs change is the *only* change, no test run is required, but
 clippy + tests must still pass for any code change that ships alongside.
 
+## Release Please
+
+Release Please reads Conventional Commits. When the user asks you to commit,
+write commit messages in this shape:
+
+```text
+<type>(optional-scope): <short imperative summary>
+
+optional body
+
+optional footer
+```
+
+Use these types consistently:
+
+- `feat`: user-visible feature or behavior addition. Triggers a minor release.
+- `fix`: user-visible bug fix. Triggers a patch release.
+- `perf`: user-visible performance improvement. Triggers a patch release.
+- `docs`: documentation-only change.
+- `refactor`: code restructuring with no intended behavior change.
+- `test`: test-only change.
+- `build`: build system, dependency, packaging, or release config change.
+- `ci`: GitHub Actions or other CI-only change.
+- `chore`: maintenance that does not fit another type.
+- `revert`: revert a previous commit.
+
+Prefer a concise scope when it adds clarity: `cli`, `fs`, `cache`, `github`,
+`config`, `docs`, `ci`, or `release`. Examples:
+
+- `feat(fs): support writable materialized worktrees`
+- `fix(cli): preserve stdout for whoami`
+- `docs: document branch override behavior`
+- `build(release): align release-please changelog sections`
+
+For breaking changes, add `!` after the type/scope and explain the break in
+the body or footer:
+
+```text
+fix(cli)!: make unmount lazy by default
+
+BREAKING CHANGE: ghfs unmount now uses lazy unmount unless --no-lazy is set.
+```
+
+Do not manually bump `Cargo.toml`, `Cargo.lock`,
+`.release-please-manifest.json`, or `CHANGELOG.md` for normal feature/fix
+work. Release Please owns version and changelog edits in its release PR.
+
 ## When extending the GitHub client
 
 1. Add the response type to `src/github/types.rs` (derive both `Serialize`
