@@ -6,9 +6,8 @@
 filesystem on Linux. Browse it with `ls`, open files in your editor,
 read what you need on demand. Every tool that takes a path just works,
 across every repo you can reach. When you actually want to change something,
-`ghfs promote` flips one repo into a real on-disk git worktree
-in-place, so `vim`, `git commit`, and `git push` flow straight through
-the mount.
+`ghfs promote` flips one repo into a real on-disk git clone in-place,
+so `vim`, `git commit`, and `git push` flow straight through the mount.
 
 ```text
 ~/ghfs/
@@ -75,12 +74,13 @@ just becomes writable, backed by a real git checkout.
   fresh; nothing is lost.
 - **Read-only by default; writable where it matters.** Edits return
   `EROFS` everywhere except inside a repo you've `ghfs promote`'d.
-  Inside that repo, ops pass through to a real worktree, so `vim`,
+  Inside that repo, ops pass through to a real working tree, so `vim`,
   `git status`, `git commit`, and `git push` all work through the
   mount.
 - **One branch per repo dir** (the GitHub default by default). Swap
-  per-repo with `ghfs branch <path> <other>`. Other branches stay
-  reachable via `ghfs promote --branch <other>`.
+  per-repo with `ghfs branch <path> <other>`. Promoted repos clone
+  every branch into `refs/heads/*` — `cd` in and `git checkout <other>`
+  to switch what the mount serves.
 - **Filter what shows up.** Yourself, everything visible, or an owner
   allowlist. Hide forks; show only private or only public. See
   [DOCS.md](DOCS.md#filtering-which-repos-appear).
@@ -177,7 +177,7 @@ Token scopes: `repo` for private repos, none for public ones.
 | `ghfs status` | List active ghfs mounts (scans `/proc/mounts`). |
 | `ghfs refresh` | Re-fetch the cached repo list. |
 | `ghfs info <path>` | Print repo metadata (URL, description, visibility, fork flag, default/effective branch) for the repo at `<path>` inside an active mount. |
-| `ghfs promote <path> [--branch B]` | Manually clone a repo branch into a local worktree (works regardless of `[clone] trigger`). `<path>` is a path inside an active mount, e.g. `~/ghfs/<owner>/<repo>`. |
+| `ghfs promote <path> [--branch B]` | Manually clone a repo into a local working copy (every branch fetched into `refs/heads/*`, `--branch` initially checked out). Works regardless of `[clone] trigger`. `<path>` is a path inside an active mount, e.g. `~/ghfs/<owner>/<repo>`. |
 | `ghfs branch <path> <B>` | Set which branch the mount surfaces under `<mount>/<owner>/<repo>/`. `<path>` is a path inside an active mount. Persistent; applies on next mount. Pass `--default` to clear. |
 | `ghfs completions <shell>` | Print a shell-completion script (`bash`, `zsh`, `fish`, `elvish`, `powershell`) to stdout. Redirect into the location your shell expects. |
 
@@ -188,7 +188,7 @@ errno mapping, systemd auto-mount, caching internals, and development workflows.
 
 * **Read-only by default; writable under materialized repos.** Writes
   outside a materialized repo return `EROFS`. Inside one, ops pass
-  through to the on-disk worktree.
+  through to the on-disk working tree.
 * **Two-level layout.** Repos live under `<mount>/<owner>/<repo>/`.
 * **One branch per repo dir.** `~/ghfs/<owner>/<repo>/` is the repo's
   effective branch (override from `ghfs branch`, falling back to the

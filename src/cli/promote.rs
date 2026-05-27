@@ -8,8 +8,9 @@ use crate::cli::status::list_ghfs_mounts;
 use crate::config::{Config, token::Token};
 use crate::github::{Conditional, GithubClient, RepoFilter};
 
-/// `ghfs promote` — manually fetch a repo (and a branch) into the local
-/// CloneStore, materializing a non-bare worktree on disk.
+/// `ghfs promote` — manually clone a repo into the local CloneStore. The
+/// clone is a regular non-bare git repo with every branch fetched into
+/// `refs/heads/*`; the requested branch is the one initially checked out.
 ///
 /// This is the same operation the FUSE layer would perform on first access
 /// under `[clone] trigger = "on_access"`, but invoked explicitly so the user
@@ -20,7 +21,9 @@ use crate::github::{Conditional, GithubClient, RepoFilter};
 /// `~/ghfs/acme/widgets` (or anywhere deeper — `~/ghfs/acme/widgets/src/x.rs`
 /// works too). `/proc/mounts` is consulted to find the mount root, and the
 /// first two path components after the root are taken as `<owner>/<repo>`.
-/// The branch comes from `--branch` or the repo's effective default.
+/// The branch comes from `--branch` or the repo's effective default. On a
+/// repeat call (the clone already exists), the working tree is left alone
+/// — the user owns it.
 pub async fn run(
     cli_token: Option<String>,
     cfg: Config,
@@ -56,12 +59,11 @@ pub async fn run(
         None => resolve_default_branch(&client, &meta, &owner, &name).await?,
     };
 
-    let fs_name = encode_branch_name(&branch);
     info!(
         owner,
         repo = name,
         branch,
-        fs_name,
+        fetch_depth = ?cfg.clone.fetch_depth,
         cache = %clone_root.display(),
         "promoting repo into local clone store"
     );
@@ -69,26 +71,29 @@ pub async fn run(
     let store =
         CloneStore::open(&clone_root, token).context("opening clone store under cache dir")?;
     let path = store
-        .ensure_worktree(&owner, &name, &branch, &fs_name, &default_remote_base())
-        .context("materializing worktree via libgit2")?;
+        .ensure_clone(
+            &owner,
+            &name,
+            &branch,
+            &default_remote_base(),
+            cfg.clone.fetch_depth,
+        )
+        .context("materializing clone via libgit2")?;
 
     println!("{}", path.display());
 
     // Surface the FUSE-side effect on stderr so stdout stays a single
     // path (scriptable). Any live mount sharing this cache will start
-    // serving the repo dir from this worktree on its next lookup
-    // (within `REPO_ENTRY_TTL` ~1s) *if* this is the repo's effective
-    // branch — otherwise the worktree exists on disk but the mount
-    // continues to show the configured branch.
+    // serving the repo dir from this clone on its next lookup (within
+    // `REPO_ENTRY_TTL` ~1s).
     // `/proc/mounts` doesn't expose `--cache-dir`, so we list every ghfs
     // mount and let the user pick the relevant one. Loop emits nothing
     // when no mount is running.
     for mount in list_ghfs_mounts().unwrap_or_default() {
         let mount_repo_path = mount.mountpoint.join(&owner).join(&name);
         eprintln!(
-            "{} will serve files from this worktree on the next lookup (~1s) if `{}` is the repo's effective branch",
-            mount_repo_path.display(),
-            branch
+            "{} will serve files from this clone on the next lookup (~1s)",
+            mount_repo_path.display()
         );
     }
     Ok(())
@@ -180,35 +185,8 @@ pub(crate) async fn resolve_default_branch(
         })
 }
 
-/// Same encoding the FUSE layer uses so the worktree dir basename matches the
-/// FUSE entry name. Duplicated rather than imported to keep this CLI module
-/// independent of `fs`.
-pub(crate) fn encode_branch_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        match ch {
-            '%' => out.push_str("%25"),
-            '/' => out.push_str("%2F"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 pub(crate) fn resolve_token(cli: Option<String>, cfg: &Config) -> Option<Token> {
     cli.filter(|s| !s.is_empty())
         .map(Token::new)
         .or_else(|| cfg.token.clone())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::encode_branch_name;
-
-    #[test]
-    fn branch_name_encoding_matches_fs_layer() {
-        assert_eq!(encode_branch_name("main"), "main");
-        assert_eq!(encode_branch_name("feature/x"), "feature%2Fx");
-        assert_eq!(encode_branch_name("release%2Ftest"), "release%252Ftest");
-    }
 }

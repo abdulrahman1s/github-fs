@@ -55,14 +55,15 @@ pub fn run(
         mountpoint = %mount_path.display(),
         cache_dir = %cache_dir.display(),
         clone_trigger = ?cfg.clone.trigger,
+        clone_fetch_depth = ?cfg.clone.fetch_depth,
         "opening caches"
     );
     let meta = Arc::new(MetaCache::open(&meta_path).context("opening metadata cache")?);
     let blobs = Arc::new(BlobStore::open(&blob_root).context("opening blob store")?);
     // Always open the clone store, even with `trigger = "never"`. The trigger
     // controls *automatic* fetching from the FUSE callbacks; manual
-    // `ghfs promote` writes worktrees into this same dir, and the FS layer
-    // routes ops to those worktrees on lookup (passthrough) so the mount and
+    // `ghfs promote` writes clones into this same dir, and the FS layer
+    // routes ops to those clones on lookup (passthrough) so the mount and
     // the CLI interoperate regardless of trigger.
     let clone_store = Some(Arc::new(
         CloneStore::open(&clone_root, token.clone()).context("opening clone store")?,
@@ -79,6 +80,7 @@ pub fn run(
         filter,
         clone_store,
         cfg.clone.trigger,
+        cfg.clone.fetch_depth,
         default_remote_base(),
     );
 

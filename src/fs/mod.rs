@@ -76,13 +76,16 @@ pub struct Ghfs {
     /// object DB once a clone exists for the repo.
     clone_store: Option<Arc<CloneStore>>,
     clone_trigger: CloneTrigger,
+    /// Shallow-clone depth passed to libgit2 on `ensure_clone`. `None` means
+    /// full history.
+    clone_fetch_depth: Option<u32>,
     /// Base URL used when CloneStore needs to fetch (`https://github.com` in
     /// production; overridden by tests to point at a local `file://` remote).
     clone_remote_base: String,
-    /// Tracks (repo_id, branch) pairs for which we've already attempted to
-    /// fetch via libgit2 during this session — success or failure. Prevents
-    /// re-trying every readdir/open after a fetch failed.
-    clone_attempted: RwLock<std::collections::HashSet<(u64, String)>>,
+    /// Tracks repo_ids for which we've already attempted to clone via libgit2
+    /// during this session — success or failure. Prevents re-trying every
+    /// readdir/open after a clone failed.
+    clone_attempted: RwLock<std::collections::HashSet<u64>>,
     /// Single timestamp used for all file attrs in this mount session. GitHub's
     /// tree API doesn't surface per-blob mtimes, so giving everything the same
     /// (mount-time) timestamp is the cheapest sensible answer.
@@ -101,6 +104,7 @@ impl Ghfs {
         filter: RepoFilter,
         clone_store: Option<Arc<CloneStore>>,
         clone_trigger: CloneTrigger,
+        clone_fetch_depth: Option<u32>,
         clone_remote_base: String,
     ) -> Self {
         let uid = unsafe { libc::geteuid() };
@@ -121,6 +125,7 @@ impl Ghfs {
             filter: Arc::new(filter),
             clone_store,
             clone_trigger,
+            clone_fetch_depth,
             clone_remote_base,
             clone_attempted: RwLock::new(std::collections::HashSet::new()),
             now: SystemTime::now(),
@@ -155,21 +160,21 @@ impl Ghfs {
         ttl_for_kind(kind)
     }
 
-    /// Return the absolute path of the on-disk worktree for `(repo, branch)`
-    /// iff one has been materialized. `None` means "no clone yet; serve
-    /// virtually via the GitHub API."
+    /// Return the absolute path of the on-disk clone for `repo` iff one has
+    /// been materialized. `None` means "no clone yet; serve virtually via
+    /// the GitHub API."
     ///
     /// This is the single routing decision that makes the FUSE inode model
     /// stable across `ghfs promote`: the inode kind never changes, but every
-    /// op checks this and dispatches to disk vs. virtual per call.
-    fn worktree_root_for(&self, repo: &RepoRef, branch: &str) -> Option<std::path::PathBuf> {
-        if branch.is_empty() {
-            return None;
-        }
+    /// op checks this and dispatches to disk vs. virtual per call. The
+    /// inode's `branch` is still load-bearing for the *virtual* path (it
+    /// selects which branch's tree to fetch from the API), so callers
+    /// continue to track it; the passthrough side just uses whatever the
+    /// user has currently checked out in the working tree.
+    fn clone_root_for(&self, repo: &RepoRef) -> Option<std::path::PathBuf> {
         let store = self.clone_store.as_ref()?;
-        let fs_name = encode_branch_name(branch);
-        if store.has_worktree(&repo.owner, &repo.name, &fs_name) {
-            Some(store.worktree_path(&repo.owner, &repo.name, &fs_name))
+        if store.has_clone(&repo.owner, &repo.name) {
+            Some(store.repo_path(&repo.owner, &repo.name))
         } else {
             None
         }
@@ -215,12 +220,12 @@ impl Ghfs {
         }
     }
 
-    /// Disk path for `ino` iff its branch has been materialized as a
-    /// worktree. Used by every op that wants to read/list/open the real
-    /// thing instead of the virtual GitHub view.
+    /// Disk path for `ino` iff its repo has been materialized as an on-disk
+    /// clone. Used by every op that wants to read/list/open the real thing
+    /// instead of the virtual GitHub view.
     fn passthrough_disk_path(&self, ino: u64) -> Option<std::path::PathBuf> {
-        let (repo, branch, rel) = self.branch_relative_path(ino)?;
-        let root = self.worktree_root_for(&repo, &branch)?;
+        let (repo, _branch, rel) = self.branch_relative_path(ino)?;
+        let root = self.clone_root_for(&repo)?;
         Some(if rel.is_empty() { root } else { root.join(rel) })
     }
 
@@ -583,7 +588,7 @@ impl Ghfs {
         // even on cache hit in sqlite, because the user explicitly asked for
         // a local clone — but only once per (repo,branch) per session.
         if matches!(self.clone_trigger, CloneTrigger::OnList) {
-            self.try_clone_branch(repo, default_branch);
+            self.try_clone_repo(repo, default_branch);
         }
 
         let tree_sha = match self.meta.get_branch_head(repo.repo_id, default_branch)? {
@@ -772,32 +777,31 @@ impl Ghfs {
 
     // ---- libgit2 clone integration helpers ----
 
-    /// Fetch `branch` via libgit2 *and* materialize a non-bare worktree under
-    /// `<clone_root>/<owner>/<repo>/<fs_name>/`, then seed the metadata cache
-    /// with the resolved tree SHA. No-op when the clone store is disabled or
-    /// this (repo,branch) has already been tried this session. Errors are
-    /// logged, not propagated — the API path is the always-available
+    /// Clone the whole repo via libgit2 (all branches fetched into
+    /// `refs/heads/*`, `branch` checked out in the working tree) and seed the
+    /// metadata cache with the resolved tree SHA. No-op when the clone store
+    /// is disabled or this repo has already been tried this session. Errors
+    /// are logged, not propagated — the API path is the always-available
     /// fallback.
     ///
-    /// We materialize the full worktree (not just a bare clone) so that:
+    /// We materialize a full clone (not a bare repo) so that:
     ///   - blob reads in this session can be served from the local object DB
-    ///     via `try_read_blob_from_clone` (same as before),
-    ///   - the user sees actual files at `<cache>/clones/<owner>/<repo>/<fs_name>/`
+    ///     via `try_read_blob_from_clone`,
+    ///   - the user sees actual files at `<cache>/clones/<owner>/<repo>/`
     ///     immediately after the trigger fires (matches the user's mental
     ///     model of "cloning"),
-    ///   - and FUSE ops on the branch start passing through to that
-    ///     worktree (writes, reads, stat) on the next `lookup`.
-    fn try_clone_branch(&self, repo: &RepoRef, branch: &str) {
+    ///   - and FUSE ops on the repo start passing through to that working
+    ///     tree (writes, reads, stat) on the next `lookup`.
+    fn try_clone_repo(&self, repo: &RepoRef, branch: &str) {
         let Some(store) = &self.clone_store else {
             return;
         };
-        let key = (repo.repo_id, branch.to_string());
         {
             let attempted = self
                 .clone_attempted
                 .read()
                 .expect("Ghfs.clone_attempted poisoned");
-            if attempted.contains(&key) {
+            if attempted.contains(&repo.repo_id) {
                 return;
             }
         }
@@ -806,38 +810,32 @@ impl Ghfs {
         self.clone_attempted
             .write()
             .expect("Ghfs.clone_attempted poisoned")
-            .insert(key);
+            .insert(repo.repo_id);
 
-        let fs_name = encode_branch_name(branch);
         info!(
             repo = %repo.name,
             branch,
-            fs_name = %fs_name,
             trigger = ?self.clone_trigger,
-            "cloning branch"
+            fetch_depth = ?self.clone_fetch_depth,
+            "cloning repo"
         );
-        if let Err(e) = store.ensure_worktree(
+        if let Err(e) = store.ensure_clone(
             &repo.owner,
             &repo.name,
             branch,
-            &fs_name,
             &self.clone_remote_base,
+            self.clone_fetch_depth,
         ) {
-            warn!(error = %e, repo = %repo.name, branch, "clone: ensure_worktree failed; falling back to GitHub API");
+            warn!(error = %e, repo = %repo.name, branch, "clone: ensure_clone failed; falling back to GitHub API");
             return;
         }
-        info!(
-            repo = %repo.name,
-            branch,
-            fs_name = %fs_name,
-            "clone ready"
-        );
-        // Worktree is now on disk. Seed branch_heads from the local object
-        // DB so the rest of the session avoids the GitHub API for this
-        // branch's tree resolution. The FS layer routes ops to the worktree
-        // dynamically (see `worktree_root_for`), so no inode invalidation
-        // is needed — the existing `Branch` inode keeps the same ino and
-        // just starts serving from disk.
+        info!(repo = %repo.name, branch, "clone ready");
+        // Clone is now on disk. Seed branch_heads from the local object DB
+        // so the rest of the session avoids the GitHub API for this branch's
+        // tree resolution. The FS layer routes ops to the working tree
+        // dynamically (see `clone_root_for`), so no inode invalidation is
+        // needed — the existing `Repo` inode keeps the same ino and just
+        // starts serving from disk.
         self.seed_branch_head_from_clone(repo, branch);
     }
 
@@ -987,7 +985,7 @@ impl Ghfs {
                 // unconditionally — no kind flip, so cwd inside the repo
                 // dir survives the transition.
                 if matches!(self.clone_trigger, CloneTrigger::OnAccess) && !branch.is_empty() {
-                    self.try_clone_branch(&rref, &branch);
+                    self.try_clone_repo(&rref, &branch);
                 }
                 let rref_for_make = rref.clone();
                 let branch_for_make = branch.clone();
@@ -1005,12 +1003,18 @@ impl Ghfs {
                 if branch.is_empty() {
                     return Ok(None);
                 }
-                if let Some(wt_root) = self.worktree_root_for(repo, branch) {
-                    // Materialized worktree: passthrough. `.git` is real
-                    // here, so skip the virtual-mode probe rejection that
-                    // would otherwise hide it from `git status`.
-                    return self
-                        .passthrough_lookup_child(parent_ino, name, repo, branch, "", &wt_root);
+                if let Some(clone_root) = self.clone_root_for(repo) {
+                    // Materialized clone: passthrough. `.git` is real here,
+                    // so skip the virtual-mode probe rejection that would
+                    // otherwise hide it from `git status`.
+                    return self.passthrough_lookup_child(
+                        parent_ino,
+                        name,
+                        repo,
+                        branch,
+                        "",
+                        &clone_root,
+                    );
                 }
                 if is_local_git_metadata_probe(name) {
                     let path = self.path_for_child(parent, name);
@@ -1039,8 +1043,8 @@ impl Ghfs {
                 repo_tree_sha,
                 path,
             } => {
-                if let Some(wt_root) = self.worktree_root_for(repo, branch) {
-                    let parent_disk = wt_root.join(path);
+                if let Some(clone_root) = self.clone_root_for(repo) {
+                    let parent_disk = clone_root.join(path);
                     return self.passthrough_lookup_child(
                         parent_ino,
                         name,
@@ -1128,9 +1132,14 @@ impl Ghfs {
                 if branch.is_empty() {
                     return Ok(Vec::new());
                 }
-                if let Some(wt_root) = self.worktree_root_for(repo, branch) {
-                    return self
-                        .passthrough_collect_children(parent_ino, repo, branch, "", &wt_root);
+                if let Some(clone_root) = self.clone_root_for(repo) {
+                    return self.passthrough_collect_children(
+                        parent_ino,
+                        repo,
+                        branch,
+                        "",
+                        &clone_root,
+                    );
                 }
                 let tree = self.get_repo_tree_index(repo, branch)?;
                 let sha = tree.sha();
@@ -1159,8 +1168,8 @@ impl Ghfs {
                 repo_tree_sha,
                 path,
             } => {
-                if let Some(wt_root) = self.worktree_root_for(repo, branch) {
-                    let parent_disk = wt_root.join(path);
+                if let Some(clone_root) = self.clone_root_for(repo) {
+                    let parent_disk = clone_root.join(path);
                     return self.passthrough_collect_children(
                         parent_ino,
                         repo,
@@ -1670,18 +1679,6 @@ fn is_local_git_metadata_probe(name: &str) -> bool {
     name == ".git"
 }
 
-fn encode_branch_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        match ch {
-            '%' => out.push_str("%25"),
-            '/' => out.push_str("%2F"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 /// Pick the kernel entry-cache TTL based on inode kind alone. Repo
 /// entries get `REPO_ENTRY_TTL` so an out-of-band clone (e.g. `ghfs
 /// promote` from another process) is picked up promptly — the inode
@@ -2088,7 +2085,7 @@ impl Filesystem for Ghfs {
         // priming the clone lets sibling-blob reads in this branch skip the
         // GitHub API afterwards.
         if matches!(self.clone_trigger, CloneTrigger::OnRead) {
-            self.try_clone_branch(&repo, &branch);
+            self.try_clone_repo(&repo, &branch);
         }
 
         // Passthrough: when the branch has a materialized worktree, open
@@ -2768,8 +2765,7 @@ impl Filesystem for Ghfs {
 #[cfg(test)]
 mod tests {
     use super::{
-        RepoSnapshot, TreeIndex, direct_children, encode_branch_name, is_local_git_metadata_probe,
-        parent_path,
+        RepoSnapshot, TreeIndex, direct_children, is_local_git_metadata_probe, parent_path,
     };
     use crate::github::{Owner, Repo, Tree, TreeEntry, TreeEntryKind};
 
@@ -2830,13 +2826,6 @@ mod tests {
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(me_repos, vec!["beta", "alpha"]);
-    }
-
-    #[test]
-    fn branch_names_are_encoded_for_single_path_component() {
-        assert_eq!(encode_branch_name("main"), "main");
-        assert_eq!(encode_branch_name("feature/foo"), "feature%2Ffoo");
-        assert_eq!(encode_branch_name("release%2Ftest"), "release%252Ftest");
     }
 
     #[test]
@@ -2988,21 +2977,23 @@ mod passthrough_tests {
             RepoFilter::default(),
             Some(store),
             CloneTrigger::Never,
+            None,
             default_remote_base(),
         );
         (fs, runtime)
     }
 
-    /// Mirror what `CloneStore::ensure_worktree` would lay down on disk,
+    /// Mirror what `CloneStore::ensure_clone` would lay down on disk,
     /// without going through libgit2 (which would need a real remote).
-    fn make_fake_worktree(
+    /// `has_clone` checks for `.git/HEAD`, so we have to plant that too.
+    fn make_fake_clone(
         clone_root: &std::path::Path,
         owner: &str,
         repo: &str,
-        fs_name: &str,
     ) -> std::path::PathBuf {
-        let wt = clone_root.join(owner).join(repo).join(fs_name);
-        std::fs::create_dir_all(&wt).unwrap();
+        let wt = clone_root.join(owner).join(repo);
+        std::fs::create_dir_all(wt.join(".git")).unwrap();
+        std::fs::write(wt.join(".git").join("HEAD"), b"ref: refs/heads/main\n").unwrap();
         wt
     }
 
@@ -3015,26 +3006,26 @@ mod passthrough_tests {
     }
 
     #[test]
-    fn worktree_root_for_returns_some_when_dir_exists() {
+    fn clone_root_for_returns_some_when_dir_exists() {
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
 
         assert!(
-            fs.worktree_root_for(&repo, "main").is_none(),
+            fs.clone_root_for(&repo).is_none(),
             "before materialization, no passthrough root"
         );
 
-        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
-        assert_eq!(fs.worktree_root_for(&repo, "main"), Some(wt));
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
+        assert_eq!(fs.clone_root_for(&repo), Some(wt));
     }
 
     #[test]
-    fn repo_inode_is_stable_across_worktree_materialization() {
+    fn repo_inode_is_stable_across_clone_materialization() {
         // The bug this fixes: a shell cwd inside `<repo>/` used to break
         // when promote ran because the inode flipped kinds and got a new
         // number. Here we lock in that the repo ino is allocated once and
-        // keeps its identity across the appearance of a worktree.
+        // keeps its identity across the appearance of a clone.
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
@@ -3049,9 +3040,9 @@ mod passthrough_tests {
                 });
         assert!(matches!(*kind_before, InodeKind::Repo { .. }));
 
-        // Worktree materializes.
-        make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
-        assert!(fs.worktree_root_for(&repo, "main").is_some());
+        // Clone materializes.
+        make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
+        assert!(fs.clone_root_for(&repo).is_some());
 
         // Re-resolving the same `(parent, name)` returns the *same* ino —
         // no eviction, no flip.
@@ -3071,7 +3062,7 @@ mod passthrough_tests {
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
-        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
         std::fs::write(wt.join("hello.txt"), b"hello world").unwrap();
         std::fs::create_dir(wt.join("src")).unwrap();
         std::fs::write(wt.join("src").join("lib.rs"), b"fn main() {}").unwrap();
@@ -3132,10 +3123,10 @@ mod passthrough_tests {
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
-        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
         std::fs::write(wt.join("README.md"), b"# hi").unwrap();
         std::fs::create_dir(wt.join("src")).unwrap();
-        std::fs::create_dir(wt.join(".git")).unwrap();
+        // `.git` is already on disk from make_fake_clone.
 
         let children = fs
             .passthrough_collect_children(123, &repo, "main", "", &wt)
@@ -3144,7 +3135,7 @@ mod passthrough_tests {
         let mut names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
         names.sort();
         // `.git` IS included — that's the whole point of passthrough; we
-        // want git commands to see the real worktree.
+        // want git commands to see the real working tree.
         assert_eq!(names, vec![".git", "README.md", "src"]);
     }
 
@@ -3153,7 +3144,7 @@ mod passthrough_tests {
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
-        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
         std::fs::create_dir(wt.join("src")).unwrap();
 
         // Repo inode → ctx maps to the worktree root.
@@ -3216,7 +3207,7 @@ mod passthrough_tests {
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
-        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
         std::fs::write(wt.join("foo.txt"), b"original").unwrap();
 
         let (repo_ino, _) =
@@ -3259,7 +3250,7 @@ mod passthrough_tests {
         let temp = tempfile::tempdir().unwrap();
         let (fs, _rt) = build_fs(temp.path());
         let repo = rref();
-        let wt = make_fake_worktree(&temp.path().join("clones"), "acme", "widgets", "main");
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
 
         let (repo_ino, _) =
             fs.inodes

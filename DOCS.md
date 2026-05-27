@@ -328,12 +328,20 @@ token.
 
 ### `ghfs promote`
 
-Manually materialize a non-bare worktree for a repo branch under the
-local clone store, without going through the FUSE mount. Equivalent to
-what `[clone] trigger = "on_access"` would do on first access, but
-invoked explicitly. Works regardless of the configured trigger — useful
-for pre-staging a repo (e.g. so you can `cd` into it offline later) or
-for forcing a fresh worktree after wiping the cache.
+Manually clone a repo into the local clone store, without going through
+the FUSE mount. Equivalent to what `[clone] trigger = "on_access"`
+would do on first access, but invoked explicitly. Works regardless of
+the configured trigger — useful for pre-staging a repo (e.g. so you can
+`cd` into it offline later) or for forcing a fresh clone after wiping
+the cache.
+
+The clone is a regular non-bare git repository. Every branch is
+fetched into `refs/heads/*`; the `--branch` argument (or the repo's
+effective default) is the one initially checked out. Once the clone
+exists, ghfs treats the working tree as the user's — switching
+branches (`git checkout dev`), committing, or making local edits is
+yours to manage. A repeat `ghfs promote` against an existing clone is
+a no-op and will **not** touch the working tree.
 
 `ghfs promote` requires a path inside an active ghfs FUSE mount. The
 owner and repo are read from the first two path components after the
@@ -349,18 +357,20 @@ ghfs promote ~/ghfs/<owner>/<repo>/src/foo.rs            # deeper path; the rest
 Flags:
 
 ```text
---branch BRANCH    Branch to materialize. Defaults to the repo's effective
-                   branch (override set via `ghfs branch`, falling back to the
-                   GitHub-default branch).
+--branch BRANCH    Branch to check out after cloning. Defaults to the repo's
+                   effective branch (override set via `ghfs branch`, falling
+                   back to the GitHub-default branch). All branches are
+                   fetched regardless — this just selects the initial checkout.
 --cache-dir DIR    Override the cache directory for this invocation.
 ```
 
-The command prints the absolute worktree path on success, suitable for
+The command prints the absolute clone path on success, suitable for
 shell substitution:
 
 ```sh
 cd "$(ghfs promote ~/ghfs/acme/widgets)"   # effective branch
 git status
+git checkout dev   # any branch the remote has is already a local ref
 ```
 
 Resolution rules:
@@ -373,24 +383,22 @@ Resolution rules:
   ghfs mount, or if it stops before naming a repo dir.
 - branch — `--branch` always wins; otherwise the cached `default_branch`
   is used; otherwise a live API lookup. Errors out if none of those
-  yields a default (e.g. a freshly-created empty repo). Mount-side
-  passthrough only kicks in when the materialized branch matches the
-  repo's *effective* branch — promoting a non-effective branch creates
-  the worktree on disk but the mount continues to show the configured
-  branch until `ghfs branch` is used to swap.
+  yields a default (e.g. a freshly-created empty repo).
+- depth — `[clone] fetch_depth = N` (or `GHFS_CLONE_FETCH_DEPTH`) caps
+  each fetched branch at N commits. Useful for huge monorepos when you
+  only need current contents. Unset = full history.
 
-`promote` always creates the worktree even when `[clone] trigger =
+`promote` always creates the clone even when `[clone] trigger =
 "never"`. It does *not* mutate the trigger config — but any live mount
 that shares the cache directory will *automatically* start serving that
-repo's files from the worktree (passthrough), within roughly one second
-(the kernel TTL for repo entries), provided the promoted branch is the
-repo's effective branch. No IPC needed; no restart required.
+repo's files from the clone (passthrough), within roughly one second
+(the kernel TTL for repo entries). No IPC needed; no restart required.
 
 The repo dir in the mount stays a normal directory before *and* after
 `promote` — there is no symlink swap. A shell `cwd` inside the repo
 dir keeps working across the transition: the inode identity is stable;
 only the backing data source changes (GitHub tree API → on-disk
-worktree).
+working tree).
 
 ### `ghfs branch`
 
@@ -499,11 +507,11 @@ background poll.
   - the repo's GitHub-default branch (`main`, `master`, `trunk`, ...) when
     no override is set.
 - Branches other than the effective one are not surfaced via the mount.
-  They remain reachable off-mount via `ghfs promote ~/ghfs/<owner>/<repo> --branch <other>`,
-  which materializes a worktree under
-  `<cache>/clones/<owner>/<repo>/<branch>/`.
-- Tags are not surfaced via the mount; check out a tag inside a
-  materialized worktree if you need one.
+  After a `ghfs promote`, every branch is fetched into the local clone
+  at `<cache>/clones/<owner>/<repo>/`, so `cd` into that dir and `git
+  checkout <other>` to switch what the mount serves.
+- Tags are not surfaced via the mount; check out a tag inside the
+  materialized clone if you need one.
 
 This means stable URIs like:
 
@@ -520,7 +528,7 @@ modulo the branch-head ETag cache TTL.
 | Property | Behavior |
 | -------- | -------- |
 | Layout | Two virtual levels above any repo: `<mount>/<owner>/<repo>/<content>`. Owner dirs are virtual (always read-only); the passthrough carve-out applies one level down, per repo. |
-| Mode | **Read-only by default; materialized repos are writable.** Writes outside a repo whose effective branch has a materialized worktree return `EROFS`. Writes inside one pass through to the on-disk worktree (so `git status`, editors, `git commit`, etc. all work). |
+| Mode | **Read-only by default; materialized repos are writable.** Writes outside a repo that has a materialized clone return `EROFS`. Writes inside one pass through to the on-disk working tree (so `git status`, editors, `git commit`, etc. all work). |
 | Inodes | Stable within a single mount session. Allocated lazily per `(parent_ino, name)`. Survive the virtual→passthrough transition with no reallocation, so a shell `cwd` keeps working across `ghfs promote`. |
 | Effective branch | Resolved once per repo at mount-time. `ghfs branch` writes are picked up at the **next mount**; running mounts continue to surface the branch they resolved at allocation time. |
 | File modes | `100644` → 0644, `100755` → 0755, `120000` → symlink, `160000` (submodule) → empty dir, `040000` → 0755 dir. Inside a materialized repo, modes reflect the real on-disk file. |
@@ -529,12 +537,12 @@ modulo the branch-head ETag cache TTL.
 | Large trees | GitHub truncates recursive trees over ~100k entries or ~7 MB. ghfs logs a warning; entries beyond the cap are omitted from the virtual view. Promote the repo (`ghfs promote`) to read it in full via libgit2. |
 | `stat` times | Virtual mode: all set to the process start time (GitHub's tree API doesn't expose per-entry mtimes). Passthrough mode: real disk times. |
 | Sizes | Virtual mode: blob size from the tree response. Passthrough mode: real disk size. |
-| Reads | First `open` triggers one `GET /repos/:o/:r/git/blobs/:sha` if the blob isn't cached, then all `read` calls `pread` against the local blob file. With a materialized clone, reads come straight from the on-disk worktree (passthrough) and skip the blob cache entirely. |
-| Writes | `EROFS` everywhere by default. Inside a materialized repo, the following ops are forwarded to `std::fs` against the worktree: `create`, `write`, `mkdir`, `unlink`, `rmdir`, `rename`, `setattr` (chmod / truncate / utimes), `symlink`, `fsync`. Cross-repo rename returns `EXDEV`. |
+| Reads | First `open` triggers one `GET /repos/:o/:r/git/blobs/:sha` if the blob isn't cached, then all `read` calls `pread` against the local blob file. With a materialized clone, reads come straight from the on-disk working tree (passthrough) and skip the blob cache entirely. |
+| Writes | `EROFS` everywhere by default. Inside a materialized repo, the following ops are forwarded to `std::fs` against the working tree: `create`, `write`, `mkdir`, `unlink`, `rmdir`, `rename`, `setattr` (chmod / truncate / utimes), `symlink`, `fsync`. Cross-repo rename returns `EXDEV`. |
 
 The FUSE layer enforces the read-only policy itself (returning `EROFS`
 from every write op unless the target ino sits under a materialized
-worktree). `MountOption::RO` is **not** used — the kernel flag can't
+clone). `MountOption::RO` is **not** used — the kernel flag can't
 express the carve-out for materialized repos.
 
 ## Configuration
@@ -573,14 +581,15 @@ include_forks  = false
 # "all" (default), "public" / "public-only", "private" / "private-only".
 visibility     = "all"
 
-# On-demand libgit2 clone (opt-in). When enabled, ghfs maintains a bare
-# clone of each visited repo under <cache_dir>/clones/<owner>/<repo>.git
-# and serves tree listings + file reads from the local object DB once the
-# clone exists. The GitHub API path remains the fallback whenever a clone
-# is missing or a libgit2 step fails — enabling this never *removes*
+# On-demand libgit2 clone (opt-in). When enabled, ghfs maintains a non-bare
+# clone of each visited repo under <cache_dir>/clones/<owner>/<repo>/ and
+# serves tree listings + file reads from the local object DB once the clone
+# exists. The GitHub API path remains the fallback whenever a clone is
+# missing or a libgit2 step fails — enabling this never *removes*
 # capability, it only adds a local-first source.
 [clone]
-trigger = "never"   # "never" (default) | "on_list" | "on_read"
+trigger     = "never"   # "never" (default) | "on_list" | "on_read" | "on_access"
+# fetch_depth = 1       # shallow-clone depth; unset / 0 = full history
 ```
 
 The parser rejects unknown keys to catch typos early. `chmod 0600
@@ -613,19 +622,26 @@ rather than triggering a refetch.
 #### Clone-on-demand
 
 The `[clone]` section opts the mount into a parallel data source backed
-by `libgit2`. When a clone exists for the repo's **effective branch**,
-ghfs's behavior changes in two ways:
+by `libgit2`. When a clone exists for a repo, ghfs's behavior changes
+in two ways:
 
 1. **Inside the mount, ops on that repo dir pass through to the on-disk
-   worktree** under `<cache>/clones/<owner>/<repo>/<fs_name>/`. `ls`,
-   `cat`, `stat`, `readlink` all read directly from real disk, not
-   from the GitHub API. The repo dir itself is still a regular
-   directory in the mount — *not* a symlink — so a shell `cwd` into
-   the repo is unaffected by the moment the clone is materialized.
+   working tree** at `<cache>/clones/<owner>/<repo>/`. `ls`, `cat`,
+   `stat`, `readlink` all read directly from real disk, not from the
+   GitHub API. The repo dir itself is still a regular directory in the
+   mount — *not* a symlink — so a shell `cwd` into the repo is
+   unaffected by the moment the clone is materialized.
 2. **For repos without a clone yet, the FUSE-virtual path still works**
    exactly as before — `ls`, `cat`, etc. continue to be served from the
    GitHub API. The clone-backed shortcut never *removes* capability; it
    only adds a faster, real-filesystem source once it exists.
+
+The clone is a regular non-bare git repository with **every branch
+fetched** into `refs/heads/*`. The branch initially checked out is the
+effective branch at clone time; `cd` into the dir and `git checkout
+<other>` to switch what the mount serves. ghfs never re-checks-out for
+you, so your working-tree state (dirty files, in-progress commits) is
+yours to manage.
 
 The switch between virtual and passthrough is a per-call dispatch
 decision; the FUSE inode for the repo (and every descendant) is
@@ -633,12 +649,16 @@ allocated once and keeps its identity for the life of the mount. This
 is the property that lets `getcwd` survive `ghfs promote` — there is
 no inode flip to invalidate the shell's open `cwd`.
 
-| `trigger` value | When the worktree is materialized |
-| --------------- | --------------------------------- |
+| `trigger` value | When the clone is materialized |
+| --------------- | ------------------------------ |
 | `"never"` *(default)* | Never automatically. `ghfs promote` is the only path. |
 | `"on_list"` | First `readdir` into a repo (e.g. `ls ~/ghfs/foo`). |
 | `"on_read"` | First `open` of a file inside a repo. Listing alone won't trigger it. |
 | `"on_access"` | First lookup of a repo path (e.g. `cd ~/ghfs/foo`). Eager: the first access blocks until the clone completes, so the very first listing already comes from disk. |
+
+`fetch_depth = N` caps each fetched branch at N commits — useful when
+cloning a giant monorepo just to browse current contents. Unset (or
+`0`) fetches full history. Env: `GHFS_CLONE_FETCH_DEPTH`.
 
 `on_list` and `on_read` fire *after* the kernel has already walked into
 the repo dir, so within the same session the triggering op completes
@@ -648,18 +668,19 @@ a single step.
 
 The transition also propagates **across processes**: repo entries
 have a 1-second kernel TTL. So `ghfs promote` from another shell starts
-serving from the worktree within ~1s in the running mount without any
-IPC — no symlink swap, no inode reallocation, just a different backing
-store on the next per-call dispatch. (`ghfs branch` is **not** in this
-category — it requires a remount; see the [subcommand](#ghfs-branch).)
+serving from the on-disk clone within ~1s in the running mount without
+any IPC — no symlink swap, no inode reallocation, just a different
+backing store on the next per-call dispatch. (`ghfs branch` is **not**
+in this category — it requires a remount; see the
+[subcommand](#ghfs-branch).)
 
-Clones are **bare** and **single-branch**: `ghfs promote --branch <other>`
-fetches just that branch's tip and adds it to the same bare repo, so
-the disk cost grows roughly linearly with the branches you actually
-browse. There is no automatic re-fetch within a mount session — the
-worktree is pinned to the commit checked out at materialization time.
-To advance to new commits, `git pull` inside the worktree at
-`<cache>/clones/<owner>/<repo>/<fs_name>/` (it's a real repo).
+Each clone is **non-bare** and **fetches every branch**: a single
+`git init` + `fetch +refs/heads/*:refs/heads/*` populates all branches
+into the same working tree's object DB. The initial checkout is the
+branch passed to `ensure_clone` (the repo's effective branch at
+trigger / promote time). There is no automatic re-fetch within a mount
+session — to advance to new commits, `cd` into the clone and `git
+pull` (or `git fetch && git checkout <other>` to switch branches).
 
 The token configured for the mount is passed to libgit2 via HTTP basic
 auth (`username = x-access-token`), which works for both classic and
@@ -668,34 +689,26 @@ fine-grained PATs.
 The disk layout under the cache:
 
 ```text
-<cache>/clones/<owner>/<repo>.git/        # shared bare object DB
-<cache>/clones/<owner>/<repo>/main/       # per-branch worktree
-<cache>/clones/<owner>/<repo>/dev/
-<cache>/clones/<owner>/<repo>/feature%2Fx/
+<cache>/clones/<owner>/<repo>/         # one non-bare clone per repo
+<cache>/clones/<owner>/<repo>/.git/    # holds every branch in refs/heads/*
 ```
-
-All worktrees share the bare repo's object DB, so additional branches
-mostly cost the size of their working tree (not full object
-duplication). Branch names with `/` are percent-encoded the same way
-they are in the FUSE entry, so `cd ~/ghfs/foo/feature%2Fx/` lands in
-the right place whether the FS is serving virtually or via passthrough.
 
 Notes:
 
 - **Repos always look like directories in the mount.** `ls -l
   ~/ghfs/` shows `dr-xr-xr-x` for every repo, virtual or passthrough;
   the distinction is invisible to userspace by design.
-- **Manual deletion is safe.** `rm -rf` a worktree dir and the mount's
-  next repo lookup falls back to the virtual path (or re-materializes
-  on the next trigger / `promote`).
+- **Manual deletion is safe.** `rm -rf` the clone dir and the mount's
+  next repo lookup falls back to the virtual path (or re-clones on the
+  next trigger / `promote`).
 - **Editing through the mount works after promote.** Inside a
   materialized repo, write ops (`create`, `write`, `mkdir`, `unlink`,
   `rmdir`, `rename`, `chmod`, `truncate`, `symlink`, `fsync`) are
-  forwarded to the on-disk worktree. So `vim ~/ghfs/repo/foo.rs`,
+  forwarded to the on-disk working tree. So `vim ~/ghfs/repo/foo.rs`,
   `git status`, and `git commit` all work from the mount path. Writes
   *outside* a materialized repo still return `EROFS`. The cache path
-  at `<cache>/clones/<owner>/<repo>/<fs_name>/` remains a normal git
-  checkout if you'd rather work there directly.
+  at `<cache>/clones/<owner>/<repo>/` remains a normal git checkout
+  if you'd rather work there directly.
 
 ### Environment variables
 
@@ -712,6 +725,7 @@ Notes:
 | `GHFS_INCLUDE_FORKS` | Override `include_forks`. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 | `GHFS_VISIBILITY` | Override `visibility`. Accepts `all`, `public` (`public-only`), or `private` (`private-only`). |
 | `GHFS_CLONE_TRIGGER` | Override `[clone] trigger`. Accepts `never`/`off`/`disabled`, `on_list`/`on-list`/`list`, `on_read`/`on-read`/`read`, or `on_access`/`on-access`/`access`. |
+| `GHFS_CLONE_FETCH_DEPTH` | Override `[clone] fetch_depth`. Positive integer = shallow clone depth; `0` = full history (same as unset). |
 | `RUST_LOG` | Standard `tracing` env var; lower precedence than `GHFS_LOG_LEVEL`. |
 
 ### CLI flags
@@ -733,8 +747,7 @@ Per-subcommand flags are listed under [Subcommands](#subcommands).
 | `~/.cache/ghfs/` | Default cache root (XDG, fallback `/tmp/ghfs-cache`). |
 | `~/.cache/ghfs/meta.db` | SQLite metadata DB. |
 | `~/.cache/ghfs/blobs/aa/<sha>` | Content-addressed blob store. |
-| `~/.cache/ghfs/clones/<owner>/<repo>.git` | Bare libgit2 clones (only present when `[clone] trigger` is enabled). |
-| `~/.cache/ghfs/clones/<owner>/<repo>/<branch>/` | Per-branch worktrees (only present when `trigger = "on_access"`). |
+| `~/.cache/ghfs/clones/<owner>/<repo>/` | Non-bare libgit2 clone (one per repo) — only present when `[clone] trigger` is enabled or after `ghfs promote`. Holds every branch in `refs/heads/*` plus a working tree. |
 | `~/.cache/ghfs/mounts/<encoded-mountpath>.pid` | Pidfile per live mount, used by `ghfs refresh` to signal `SIGUSR1`. Removed on graceful shutdown; stale entries reaped by `ghfs refresh`. |
 
 ## Cache layout
@@ -763,13 +776,22 @@ holds 50k files). Writes are atomic via `NamedTempFile + persist`.
 
 ### Clone store
 
-When `[clone] trigger` is anything other than `"never"`, ghfs also keeps
-bare libgit2 clones under `<cache_dir>/clones/<owner>/<repo>.git`. Each
-clone is initialised on demand and fetched one branch at a time; visiting
-a second branch in the same repo adds it to the same bare repo. The
-clones are **rebuildable** in the same sense as the rest of the cache —
-delete the directory and the next access (with the trigger still on)
-will refetch.
+When `[clone] trigger` is anything other than `"never"` (or when `ghfs
+promote` runs), ghfs keeps a non-bare libgit2 clone of each visited
+repo at `<cache_dir>/clones/<owner>/<repo>/`. Each clone is a regular
+git working tree with **every branch fetched** into `refs/heads/*` and
+the repo's effective branch initially checked out. After the first
+clone, ghfs never touches the working tree again — `git checkout`,
+local edits, in-progress commits are all yours. The clones are
+**rebuildable** in the same sense as the rest of the cache — delete
+the directory and the next access (with the trigger still on) will
+re-clone.
+
+`fetch_depth = N` makes the fetch shallow (libgit2's `--depth N`),
+which is useful for huge monorepos when you only need current
+contents. Note: libgit2's local (`file://`) transport does **not**
+support shallow fetches; this only kicks in for real `https://`
+remotes.
 
 Under `trigger = "on_list"` / `"on_read"`, the clone store is a parallel
 source: tree listings and blob reads first consult the clone, and fall
@@ -777,15 +799,13 @@ back to the GitHub API on miss. The metadata DB and blob store are still
 populated as before, so disabling `[clone]` later cleanly returns to the
 API-only flow with the existing on-disk caches intact.
 
-Under `trigger = "on_access"`, the same bare repo is created, *plus* a
-worktree for the repo's effective branch at
-`<cache_dir>/clones/<owner>/<repo>/<branch>/`. Additional branches
-materialized via `ghfs promote --branch <other>` get their own
-worktrees alongside. The worktrees share the bare repo's object DB.
-Each is a fully-formed non-bare git checkout — you can `cd` into it
-and use `git`. ghfs leaves worktree contents alone after creation, so
-any local commits or edits you make persist until you remove the
-worktree (or wipe the cache).
+Under `trigger = "on_access"`, the clone is materialized synchronously
+on first lookup into the repo dir, so the very first listing already
+comes from disk. Switching what the mount serves between branches is a
+matter of `cd ~/.cache/ghfs/clones/<owner>/<repo> && git checkout
+<other>`; the mount picks up the new working-tree contents on the
+next stat (kernel attr TTL is forced to zero under passthrough so
+external `git` writes are visible immediately).
 
 ### Conditional requests
 
@@ -985,10 +1005,9 @@ RUST_LOG=ghfs=debug ghfs mount ~/ghfs
 ## Safety and privacy
 
 `ghfs` never pushes to GitHub. Writes to the mount either return
-`EROFS` (virtual repos) or land in the on-disk worktree under
-`<cache>/clones/<owner>/<repo>/<branch>/` (materialized repos) —
-pushing those local commits up is your call (`git push` inside the
-worktree).
+`EROFS` (virtual repos) or land in the on-disk working tree at
+`<cache>/clones/<owner>/<repo>/` (materialized repos) — pushing those
+local commits up is your call (`git push` inside the clone).
 
 What it _does_ do is talk to GitHub on your behalf and cache the
 responses on local disk:
@@ -1124,7 +1143,7 @@ assets and verifies the checksum on download.
    - Map errors through `GhfsError::to_errno`.
 3. Write ops must return `EROFS` by default. The single carve-out is
    paths under a materialized repo: forward to `std::fs` against
-   `<cache>/clones/<owner>/<repo>/<fs_name>/<rel>` when
+   `<cache>/clones/<owner>/<repo>/<rel>` when
    `passthrough_disk_path(&kind)` is `Some`. `MountOption::RO` is **not**
    used — the FUSE layer enforces the policy itself.
 

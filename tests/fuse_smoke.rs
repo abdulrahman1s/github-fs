@@ -112,6 +112,7 @@ fn end_to_end_mount_lists_repos_and_reads_a_file() {
         RepoFilter::default(),
         None,
         github_fs::CloneTrigger::Never,
+        None,
         github_fs::cache::default_remote_base(),
     );
 

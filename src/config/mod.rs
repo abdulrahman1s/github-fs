@@ -147,8 +147,8 @@ fn parse_bool_env(raw: &str) -> Option<bool> {
     }
 }
 
-/// Controls whether (and when) ghfs makes a bare libgit2 clone of a repo
-/// alongside the existing GitHub-API path.
+/// Controls whether (and when) ghfs makes a libgit2 clone of a repo alongside
+/// the existing GitHub-API path.
 ///
 /// When a clone is present, tree listings and blob reads are served from the
 /// local object database (offline-capable, no per-blob HTTP round-trip). The
@@ -160,17 +160,15 @@ pub enum CloneTrigger {
     /// Default: never clone. ghfs behaves exactly as before.
     #[default]
     Never,
-    /// Clone the first time a branch's contents are listed (`readdir` on the
-    /// branch directory). Browsing into the repo triggers the clone.
+    /// Clone the first time the repo's contents are listed (`readdir` on the
+    /// repo directory). Browsing into the repo triggers the clone.
     OnList,
     /// Clone the first time a file inside the repo is opened. Listing still
     /// uses the API; only file reads trigger the clone.
     OnRead,
-    /// Surface each branch as a *symlink* to a real on-disk worktree under
-    /// `<cache>/clones/<owner>/<repo>/<fs_branch_name>/`. The worktree is
-    /// materialized synchronously on the first `readlink` (i.e. when the
-    /// kernel first needs to walk into the branch). All subsequent ops
-    /// inside the branch hit the real filesystem — `git status` works.
+    /// Materialize a real on-disk clone at `<cache>/clones/<owner>/<repo>/`
+    /// the first time the FS walks into the repo. Subsequent ops inside the
+    /// repo hit the real filesystem — `git status` works.
     OnAccess,
 }
 
@@ -190,14 +188,19 @@ impl CloneTrigger {
 #[serde(default, deny_unknown_fields)]
 struct CloneConfigFile {
     trigger: Option<String>,
+    fetch_depth: Option<u32>,
 }
 
-/// Resolved clone settings. Currently a single field, but kept as a struct so
-/// future knobs (clone depth, ref shape) can be added without changing the
-/// `Config` shape.
+/// Resolved clone settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CloneConfig {
     pub trigger: CloneTrigger,
+    /// Shallow-clone depth passed to libgit2 when ghfs fetches a repo. `None`
+    /// (or `Some(0)` from config) means full history. A positive value caps
+    /// each branch at that many commits — useful when fetching huge monorepos
+    /// just to browse current contents, since `fetch +refs/heads/*` would
+    /// otherwise pull every branch's full history.
+    pub fetch_depth: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -363,6 +366,14 @@ fn resolve(file: ConfigFile, env: &HashMap<String, String>, file_present: bool) 
         })
         .unwrap_or_default();
 
+    // `0` is the explicit "full clone" sentinel from TOML/env, normalized to
+    // `None` so the downstream code only sees "set to N" vs "leave alone".
+    let fetch_depth = env
+        .get("GHFS_CLONE_FETCH_DEPTH")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| file.clone.as_ref().and_then(|c| c.fetch_depth))
+        .filter(|d| *d > 0);
+
     Config {
         token,
         mount_path,
@@ -375,6 +386,7 @@ fn resolve(file: ConfigFile, env: &HashMap<String, String>, file_present: bool) 
         visibility,
         clone: CloneConfig {
             trigger: clone_trigger,
+            fetch_depth,
         },
         config_file_present: file_present,
     }
@@ -759,6 +771,56 @@ trigger = "on_list""#,
         .unwrap();
         let cfg = resolve(cf, &env(&[("GHFS_CLONE_TRIGGER", "tomorrow")]), true);
         assert_eq!(cfg.clone.trigger, CloneTrigger::OnList);
+    }
+
+    #[test]
+    fn clone_fetch_depth_defaults_to_none() {
+        let cfg = resolve(ConfigFile::default(), &HashMap::new(), false);
+        assert_eq!(cfg.clone.fetch_depth, None);
+    }
+
+    #[test]
+    fn clone_fetch_depth_parses_from_toml() {
+        let cf: ConfigFile = toml::from_str(
+            r#"[clone]
+fetch_depth = 50"#,
+        )
+        .unwrap();
+        let cfg = resolve(cf, &HashMap::new(), true);
+        assert_eq!(cfg.clone.fetch_depth, Some(50));
+    }
+
+    #[test]
+    fn clone_fetch_depth_zero_means_full_clone() {
+        let cf: ConfigFile = toml::from_str(
+            r#"[clone]
+fetch_depth = 0"#,
+        )
+        .unwrap();
+        let cfg = resolve(cf, &HashMap::new(), true);
+        assert_eq!(cfg.clone.fetch_depth, None);
+    }
+
+    #[test]
+    fn clone_fetch_depth_env_overrides_file() {
+        let cf: ConfigFile = toml::from_str(
+            r#"[clone]
+fetch_depth = 10"#,
+        )
+        .unwrap();
+        let cfg = resolve(cf, &env(&[("GHFS_CLONE_FETCH_DEPTH", "1")]), true);
+        assert_eq!(cfg.clone.fetch_depth, Some(1));
+    }
+
+    #[test]
+    fn clone_fetch_depth_unparseable_env_falls_back_to_file() {
+        let cf: ConfigFile = toml::from_str(
+            r#"[clone]
+fetch_depth = 25"#,
+        )
+        .unwrap();
+        let cfg = resolve(cf, &env(&[("GHFS_CLONE_FETCH_DEPTH", "deep")]), true);
+        assert_eq!(cfg.clone.fetch_depth, Some(25));
     }
 
     #[test]

@@ -96,10 +96,12 @@
 # any libgit2 step fails — enabling this only *adds* capability.
 #
 # Disk layout under cache_dir:
-#   clones/<owner>/<repo>.git/             # shared bare object DB
-#   clones/<owner>/<repo>/<fs_branch>/     # per-branch worktree
+#   clones/<owner>/<repo>/         # one non-bare clone per repo, with
+#                                  # every branch fetched into refs/heads/*.
+#                                  # The user's working tree — `git checkout`
+#                                  # to switch what the mount serves.
 [clone]
-# When to materialize a worktree:
+# When to materialize a clone:
 #   "never"     (default) — never automatically; only `ghfs promote` clones.
 #   "on_list"             — first `readdir` into a repo (e.g. `ls ~/ghfs/foo`).
 #   "on_read"             — first `open` of a file inside a repo. Listing
@@ -111,3 +113,11 @@
 # Env: GHFS_CLONE_TRIGGER — accepts never/off/disabled,
 #      on_list/on-list/list, on_read/on-read/read, on_access/on-access/access.
 trigger = "never"
+
+# Shallow-clone depth. None / 0 = full history. A positive integer caps
+# each fetched branch at that many commits — useful when cloning a
+# huge monorepo just to browse current contents, since the clone fetches
+# +refs/heads/* (every branch) and full history can be enormous.
+# Env: GHFS_CLONE_FETCH_DEPTH
+# Default: unset (full clone).
+# fetch_depth = 1
