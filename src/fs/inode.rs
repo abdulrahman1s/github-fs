@@ -76,12 +76,18 @@ pub enum InodeKind {
 }
 
 /// Per-session inode allocator. Maps (parent_ino, name) -> stable ino so
-/// repeated lookups return the same inode within a mount; once allocated, an
-/// InodeKind is never mutated.
+/// repeated lookups return the same inode within a mount.
+///
+/// `by_ino_link` is the reverse of `by_path`: it answers "what is this
+/// inode's current parent + name?" and is what makes ino identity survive
+/// rename. Passthrough disk-path resolution walks up this map instead of
+/// trusting the (potentially stale) `path` field baked into an `InodeKind`
+/// at allocation time. See `Ghfs::branch_relative_path`.
 pub struct InodeTable {
     next_ino: AtomicU64,
     by_ino: RwLock<HashMap<u64, Arc<InodeKind>>>,
     by_path: RwLock<HashMap<(u64, String), u64>>,
+    by_ino_link: RwLock<HashMap<u64, (u64, String)>>,
 }
 
 impl Default for InodeTable {
@@ -98,6 +104,7 @@ impl InodeTable {
             next_ino: AtomicU64::new(FUSE_ROOT_INO + 1),
             by_ino: RwLock::new(by_ino),
             by_path: RwLock::new(HashMap::new()),
+            by_ino_link: RwLock::new(HashMap::new()),
         }
     }
 
@@ -109,21 +116,68 @@ impl InodeTable {
             .cloned()
     }
 
+    /// Current `(parent_ino, name)` for `ino`. The root has no link.
+    /// Source of truth for "where does this inode live now," updated by
+    /// `relocate` on rename so disk-path resolution stays correct even
+    /// when the kernel holds a stale reference to an inode whose name
+    /// has since changed.
+    pub fn parent_link(&self, ino: u64) -> Option<(u64, String)> {
+        self.by_ino_link
+            .read()
+            .expect("InodeTable.by_ino_link poisoned")
+            .get(&ino)
+            .cloned()
+    }
+
     /// Drop the `(parent, name) → ino` mapping. Used by write ops that
-    /// delete the underlying disk entry (unlink/rmdir/rename) so a
-    /// subsequent create reuses the slot with a fresh ino — kernel page
-    /// cache is keyed by inode, and a stale ino would let post-unlink
-    /// reads see ghost data.
+    /// delete the underlying disk entry (unlink/rmdir) so a subsequent
+    /// create reuses the slot with a fresh ino — kernel page cache is
+    /// keyed by inode, and a stale ino would let post-unlink reads see
+    /// ghost data.
     ///
-    /// The old ino is **not** removed from `by_ino`: any in-flight FUSE
-    /// op or open file handle still references it. We just stop returning
-    /// it for future name resolutions.
+    /// The old ino is **not** removed from `by_ino` or `by_ino_link`:
+    /// any in-flight FUSE op or open file handle still references it.
+    /// We just stop returning it for future name resolutions.
     pub fn evict(&self, parent: u64, name: &str) -> Option<u64> {
         let key = (parent, name.to_string());
         self.by_path
             .write()
             .expect("InodeTable.by_path poisoned")
             .remove(&key)
+    }
+
+    /// Move the `(old_parent, old_name) → ino` mapping to
+    /// `(new_parent, new_name) → ino`, keeping the same ino. This is
+    /// what `rename(2)` looks like from the FS's perspective: the
+    /// inode's identity is preserved (matching POSIX semantics — fds
+    /// and cached dentries remain valid against the renamed file), only
+    /// its reverse link is rewritten. Any inode previously occupying
+    /// the destination name is unlinked from `by_path` (its ino survives
+    /// in `by_ino` so in-flight ops can finish, but it's no longer
+    /// name-addressable).
+    ///
+    /// Returns the relocated ino, or `None` if no entry existed at the
+    /// source.
+    pub fn relocate(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Option<u64> {
+        let mut by_path = self.by_path.write().expect("InodeTable.by_path poisoned");
+        let ino = by_path.remove(&(old_parent, old_name.to_string()))?;
+        // If the destination name was already mapped (rename-overwrite),
+        // drop that mapping so the renamed ino owns the name now.
+        by_path.remove(&(new_parent, new_name.to_string()));
+        by_path.insert((new_parent, new_name.to_string()), ino);
+        drop(by_path);
+
+        self.by_ino_link
+            .write()
+            .expect("InodeTable.by_ino_link poisoned")
+            .insert(ino, (new_parent, new_name.to_string()));
+        Some(ino)
     }
 
     /// Return the inode for `(parent, name)`, allocating one (via `make`) if
@@ -165,6 +219,11 @@ impl InodeTable {
             .expect("InodeTable.by_ino poisoned")
             .insert(ino, kind.clone());
         by_path.insert(key, ino);
+        drop(by_path);
+        self.by_ino_link
+            .write()
+            .expect("InodeTable.by_ino_link poisoned")
+            .insert(ino, (parent, name.to_string()));
         (ino, kind)
     }
 
@@ -262,5 +321,82 @@ mod tests {
     fn get_returns_none_for_unknown_ino() {
         let t = InodeTable::new();
         assert!(t.get(9_999_999).is_none());
+    }
+
+    #[test]
+    fn parent_link_records_alloc_site_and_relocate_updates_it() {
+        // This locks in the rename-survives invariant: an inode is
+        // reachable through its current (parent, name) via by_path, and
+        // the reverse (parent_link) reflects the same. After relocate,
+        // both flip together — same ino, new name.
+        let t = InodeTable::new();
+        let (ino, _) = t.lookup_or_create(FUSE_ROOT_INO, "old", || InodeKind::File {
+            repo: rref(),
+            branch: "main".into(),
+            path: "old".into(),
+            blob_sha: String::new(),
+            size: 0,
+            executable: false,
+        });
+        assert_eq!(t.parent_link(ino), Some((FUSE_ROOT_INO, "old".into())));
+
+        let relocated = t.relocate(FUSE_ROOT_INO, "old", FUSE_ROOT_INO, "new");
+        assert_eq!(relocated, Some(ino), "rename must preserve the ino");
+        assert_eq!(t.parent_link(ino), Some((FUSE_ROOT_INO, "new".into())));
+
+        let (ino_again, _) = t.lookup_or_create(FUSE_ROOT_INO, "new", || {
+            panic!(
+                "factory must not be called: relocated ino must already be cached at the new name"
+            );
+        });
+        assert_eq!(ino_again, ino);
+    }
+
+    #[test]
+    fn relocate_overwrites_destination() {
+        // rename(2) atomically replaces an existing destination; mirror
+        // that in by_path so the renamed ino owns the new name and the
+        // displaced ino loses its name-addressability.
+        let t = InodeTable::new();
+        let (src, _) = t.lookup_or_create(FUSE_ROOT_INO, "src", || InodeKind::File {
+            repo: rref(),
+            branch: "main".into(),
+            path: "src".into(),
+            blob_sha: String::new(),
+            size: 0,
+            executable: false,
+        });
+        let (dst, _) = t.lookup_or_create(FUSE_ROOT_INO, "dst", || InodeKind::File {
+            repo: rref(),
+            branch: "main".into(),
+            path: "dst".into(),
+            blob_sha: String::new(),
+            size: 0,
+            executable: false,
+        });
+        assert_ne!(src, dst);
+
+        assert_eq!(
+            t.relocate(FUSE_ROOT_INO, "src", FUSE_ROOT_INO, "dst"),
+            Some(src)
+        );
+
+        let (ino_at_dst, _) = t.lookup_or_create(FUSE_ROOT_INO, "dst", || {
+            panic!("dst must now resolve to the renamed ino");
+        });
+        assert_eq!(ino_at_dst, src);
+
+        // The displaced inode still exists in by_ino (in-flight ops are
+        // safe) but is no longer reachable by name.
+        assert!(t.get(dst).is_some());
+    }
+
+    #[test]
+    fn relocate_returns_none_when_source_missing() {
+        let t = InodeTable::new();
+        assert_eq!(
+            t.relocate(FUSE_ROOT_INO, "ghost", FUSE_ROOT_INO, "elsewhere"),
+            None
+        );
     }
 }
