@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -7,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::cache::MetaCache;
 use crate::config::{Config, token::Token};
-use crate::github::{Conditional, GithubClient, RepoFilter};
+use crate::github::{Conditional, GithubClient, Repo, RepoFilter};
 
 pub async fn run(
     cli_token: Option<String>,
@@ -37,27 +39,38 @@ pub async fn run(
     let filter =
         RepoFilter::new(cfg.owners.clone(), cfg.include_forks).with_visibility(cfg.visibility);
 
-    let count = refresh_repos(&client, &meta, &filter).await?;
-    println!("refreshed {count} repos -> {}", meta_path.display());
+    let report = refresh_repos_with_report(&client, &meta, &filter).await?;
+    let events = notify_live_mounts(&cache_dir);
+    print!("{}", render_refresh_output(&report, &meta_path, &events));
+    Ok(())
+}
 
-    for ev in notify_live_mounts(&cache_dir) {
-        match ev {
-            NotifyEvent::Notified { pid, mount_path } => {
-                println!("  notified mount at {mount_path} (pid {pid})");
-            }
-            NotifyEvent::ReapedStale { mount_path, pid } => {
-                println!("  reaped stale pidfile for {mount_path} (pid {pid} gone)");
-            }
-            NotifyEvent::SignalFailed {
-                pid,
-                mount_path,
-                error,
-            } => {
-                println!("  could not notify mount at {mount_path} (pid {pid}): {error}");
-            }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshReport {
+    pub total_repos: usize,
+    pub added: Vec<RepoSummary>,
+    pub removed: Vec<RepoSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSummary {
+    pub full_name: String,
+    pub private: bool,
+    pub fork: bool,
+    pub default_branch: Option<String>,
+    pub description: Option<String>,
+}
+
+impl RepoSummary {
+    fn from_repo(repo: &Repo) -> Self {
+        Self {
+            full_name: repo_full_name(repo),
+            private: repo.private,
+            fork: repo.fork,
+            default_branch: repo.default_branch.clone(),
+            description: repo.description.clone(),
         }
     }
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -191,6 +204,17 @@ pub async fn refresh_repos(
     meta: &MetaCache,
     filter: &RepoFilter,
 ) -> Result<usize> {
+    Ok(refresh_repos_with_report(client, meta, filter)
+        .await?
+        .total_repos)
+}
+
+pub async fn refresh_repos_with_report(
+    client: &GithubClient,
+    meta: &MetaCache,
+    filter: &RepoFilter,
+) -> Result<RefreshReport> {
+    let before = meta.get_repos().context("reading cached repos")?;
     let result = client
         .list_user_repos(None, filter)
         .await
@@ -207,13 +231,13 @@ pub async fn refresh_repos(
         }
     };
 
-    let count = repos.len();
+    let report = build_refresh_report(&before, &repos);
     meta.put_repos(&repos).context("writing repos to cache")?;
     if let Some(e) = etag {
         meta.put_etag(filter.etag_cache_key(), &e)
             .context("writing etag to cache")?;
     }
-    Ok(count)
+    Ok(report)
 }
 
 fn resolve_token(cli: Option<String>, cfg: &Config) -> Option<Token> {
@@ -222,9 +246,237 @@ fn resolve_token(cli: Option<String>, cfg: &Config) -> Option<Token> {
         .or_else(|| cfg.token.clone())
 }
 
+fn build_refresh_report(before: &[Repo], after: &[Repo]) -> RefreshReport {
+    let before_names: BTreeSet<String> = before.iter().map(repo_full_name).collect();
+    let after_names: BTreeSet<String> = after.iter().map(repo_full_name).collect();
+
+    let mut added: Vec<RepoSummary> = after
+        .iter()
+        .filter(|repo| !before_names.contains(&repo_full_name(repo)))
+        .map(RepoSummary::from_repo)
+        .collect();
+    let mut removed: Vec<RepoSummary> = before
+        .iter()
+        .filter(|repo| !after_names.contains(&repo_full_name(repo)))
+        .map(RepoSummary::from_repo)
+        .collect();
+
+    added.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    removed.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+
+    RefreshReport {
+        total_repos: after.len(),
+        added,
+        removed,
+    }
+}
+
+fn repo_full_name(repo: &Repo) -> String {
+    format!("{}/{}", repo.owner.login, repo.name)
+}
+
+fn render_refresh_output(
+    report: &RefreshReport,
+    meta_path: &Path,
+    events: &[NotifyEvent],
+) -> String {
+    let mut out = String::new();
+    writeln!(&mut out, "Repo cache refreshed").unwrap();
+    writeln!(&mut out, "  cache: {}", meta_path.display()).unwrap();
+    writeln!(
+        &mut out,
+        "  repos: {} total, {} added, {} removed",
+        report.total_repos,
+        report.added.len(),
+        report.removed.len()
+    )
+    .unwrap();
+
+    if report.added.is_empty() && report.removed.is_empty() {
+        writeln!(&mut out).unwrap();
+        writeln!(&mut out, "Changes: none").unwrap();
+    } else {
+        if !report.added.is_empty() {
+            writeln!(&mut out).unwrap();
+            writeln!(&mut out, "Added repos:").unwrap();
+            for repo in &report.added {
+                write_repo_summary(&mut out, '+', repo);
+            }
+        }
+
+        if !report.removed.is_empty() {
+            writeln!(&mut out).unwrap();
+            writeln!(&mut out, "Removed repos:").unwrap();
+            for repo in &report.removed {
+                write_repo_summary(&mut out, '-', repo);
+            }
+        }
+    }
+
+    writeln!(&mut out).unwrap();
+    writeln!(&mut out, "Live mounts:").unwrap();
+    if events.is_empty() {
+        writeln!(&mut out, "  none").unwrap();
+    } else {
+        for ev in events {
+            match ev {
+                NotifyEvent::Notified { pid, mount_path } => {
+                    writeln!(&mut out, "  notified {mount_path} (pid {pid})").unwrap();
+                }
+                NotifyEvent::ReapedStale { mount_path, pid } => {
+                    writeln!(
+                        &mut out,
+                        "  reaped stale pidfile for {mount_path} (pid {pid} gone)"
+                    )
+                    .unwrap();
+                }
+                NotifyEvent::SignalFailed {
+                    pid,
+                    mount_path,
+                    error,
+                } => {
+                    writeln!(
+                        &mut out,
+                        "  could not notify {mount_path} (pid {pid}): {error}"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn write_repo_summary(out: &mut String, marker: char, repo: &RepoSummary) {
+    let visibility = if repo.private { "private" } else { "public" };
+    let fork = if repo.fork { ", fork" } else { "" };
+    let branch = repo.default_branch.as_deref().unwrap_or("<none>");
+    match compact_description(repo.description.as_deref()) {
+        Some(description) => writeln!(
+            out,
+            "  {marker} {} ({visibility}{fork}, default: {branch}) - {description}",
+            repo.full_name
+        )
+        .unwrap(),
+        None => writeln!(
+            out,
+            "  {marker} {} ({visibility}{fork}, default: {branch})",
+            repo.full_name
+        )
+        .unwrap(),
+    }
+}
+
+fn compact_description(description: Option<&str>) -> Option<String> {
+    let mut compact = String::new();
+    for word in description?.split_whitespace() {
+        if !compact.is_empty() {
+            compact.push(' ');
+        }
+        compact.push_str(word);
+    }
+    if compact.is_empty() {
+        return None;
+    }
+
+    const MAX_DESCRIPTION_CHARS: usize = 96;
+    if compact.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return Some(compact);
+    }
+
+    let mut truncated: String = compact
+        .chars()
+        .take(MAX_DESCRIPTION_CHARS.saturating_sub(3))
+        .collect();
+    truncated.push_str("...");
+    Some(truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::Owner;
+
+    fn repo(id: u64, owner: &str, name: &str) -> Repo {
+        Repo {
+            id,
+            name: name.to_string(),
+            full_name: format!("{owner}/{name}"),
+            owner: Owner {
+                login: owner.to_string(),
+                id,
+            },
+            private: false,
+            default_branch: Some("main".to_string()),
+            description: None,
+            size: 1,
+            fork: false,
+        }
+    }
+
+    #[test]
+    fn build_refresh_report_detects_added_and_removed_repos() {
+        let before = vec![repo(1, "abdul", "old"), repo(2, "abdul", "stay")];
+        let after = vec![repo(2, "abdul", "stay"), repo(3, "org", "new")];
+
+        let report = build_refresh_report(&before, &after);
+
+        assert_eq!(report.total_repos, 2);
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.added[0].full_name, "org/new");
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].full_name, "abdul/old");
+    }
+
+    #[test]
+    fn render_refresh_output_includes_repo_changes_and_mounts() {
+        let report = RefreshReport {
+            total_repos: 2,
+            added: vec![RepoSummary {
+                full_name: "abdul/new".to_string(),
+                private: true,
+                fork: true,
+                default_branch: Some("trunk".to_string()),
+                description: Some("newly visible repo".to_string()),
+            }],
+            removed: vec![RepoSummary {
+                full_name: "abdul/old".to_string(),
+                private: false,
+                fork: false,
+                default_branch: Some("main".to_string()),
+                description: None,
+            }],
+        };
+        let events = vec![NotifyEvent::Notified {
+            pid: 42,
+            mount_path: "/mnt/ghfs".to_string(),
+        }];
+
+        let rendered = render_refresh_output(&report, Path::new("/tmp/ghfs/meta.db"), &events);
+
+        assert!(rendered.contains("Repo cache refreshed"));
+        assert!(rendered.contains("repos: 2 total, 1 added, 1 removed"));
+        assert!(
+            rendered.contains("+ abdul/new (private, fork, default: trunk) - newly visible repo")
+        );
+        assert!(rendered.contains("- abdul/old (public, default: main)"));
+        assert!(rendered.contains("notified /mnt/ghfs (pid 42)"));
+    }
+
+    #[test]
+    fn render_refresh_output_reports_no_changes_or_mounts() {
+        let report = RefreshReport {
+            total_repos: 1,
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
+
+        let rendered = render_refresh_output(&report, Path::new("/tmp/ghfs/meta.db"), &[]);
+
+        assert!(rendered.contains("Changes: none"));
+        assert!(rendered.contains("Live mounts:\n  none"));
+    }
 
     #[test]
     fn read_pidfile_parses_two_line_format() {

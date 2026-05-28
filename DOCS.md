@@ -475,6 +475,12 @@ Re-fetches your repo list and updates the on-disk cache. Use this after
 you create or delete a repo on GitHub if you don't want to wait for the
 TTL to expire or for the next remount.
 
+The command prints a short report with the metadata cache path, total
+repo count, added and removed repo counts, and the visible repo paths
+that changed. Added/removed repo lines include visibility, fork status,
+default branch, and the GitHub description when present, so newly
+created repos are easy to spot immediately after refresh.
+
 `refresh` doesn't touch branch heads, trees, or blobs — only the
 top-level "what repos does this user have" listing. Trees are immutable
 by SHA and never need invalidation; branch heads expire via ETag on the

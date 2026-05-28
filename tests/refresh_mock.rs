@@ -1,7 +1,7 @@
 use github_fs::cache::{MetaCache, OWNED_USER_REPOS_ETAG_KEY};
-use github_fs::cli::refresh::refresh_repos;
+use github_fs::cli::refresh::{refresh_repos, refresh_repos_with_report};
 use github_fs::config::token::Token;
-use github_fs::github::{GithubClient, RepoFilter};
+use github_fs::github::{GithubClient, Owner, Repo, RepoFilter};
 use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -22,6 +22,23 @@ fn repo_json(id: u64, name: &str) -> serde_json::Value {
         "size": 1,
         "description": null,
     })
+}
+
+fn repo_struct(id: u64, name: &str) -> Repo {
+    Repo {
+        id,
+        name: name.to_string(),
+        full_name: format!("abdul/{name}"),
+        owner: Owner {
+            login: "abdul".to_string(),
+            id: 42,
+        },
+        private: false,
+        default_branch: Some("main".to_string()),
+        description: None,
+        size: 1,
+        fork: false,
+    }
 }
 
 #[tokio::test]
@@ -56,6 +73,33 @@ async fn refresh_overwrites_cache_with_fresh_repos_and_etag() {
 
     let etag = meta.get_etag(OWNED_USER_REPOS_ETAG_KEY).unwrap();
     assert_eq!(etag.as_deref(), Some("\"fresh\""));
+}
+
+#[tokio::test]
+async fn refresh_report_lists_added_and_removed_repos() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user/repos"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([repo_json(1, "alpha"), repo_json(2, "beta")])),
+        )
+        .mount(&server)
+        .await;
+
+    let meta = MetaCache::open_in_memory().unwrap();
+    meta.put_repos(&[repo_struct(9, "gone"), repo_struct(2, "beta")])
+        .unwrap();
+
+    let report = refresh_repos_with_report(&client(&server), &meta, &RepoFilter::default())
+        .await
+        .unwrap();
+
+    assert_eq!(report.total_repos, 2);
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].full_name, "abdul/alpha");
+    assert_eq!(report.removed.len(), 1);
+    assert_eq!(report.removed[0].full_name, "abdul/gone");
 }
 
 #[tokio::test]

@@ -62,9 +62,9 @@ pub enum Command {
     /// List active ghfs mounts by scanning /proc/mounts.
     Status,
 
-    /// Re-fetch the authenticated user's repo list and update the on-disk
-    /// cache. Useful when you've added/removed repos on GitHub and don't
-    /// want to wait for the next remount.
+    /// Re-fetch the authenticated user's repo list, print added/removed
+    /// repos, and update the on-disk cache. Useful when you've added/removed
+    /// repos on GitHub and don't want to wait for the next remount.
     Refresh {
         #[arg(long)]
         cache_dir: Option<PathBuf>,

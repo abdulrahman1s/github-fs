@@ -160,7 +160,7 @@ ghfs unmount ~/ghfs
 # list active ghfs mounts
 ghfs status
 
-# force-refresh the cached repo list (after creating/deleting repos on GitHub)
+# force-refresh the cached repo list and show added/removed repos
 # — also signals every running mount via SIGUSR1 to pick up the change in place
 ghfs refresh
 ```
@@ -175,7 +175,7 @@ Token scopes: `repo` for private repos, none for public ones.
 | `ghfs mount <path>` | Mount the GitHub filesystem at `<path>` (foreground). |
 | `ghfs unmount <path> [--strict]` | Unmount via `fusermount3 -uz` (lazy by default — detaches a busy mount and frees it once the last reference drops). Pass `--strict` to refuse on busy and surface the holder PIDs instead. |
 | `ghfs status` | List active ghfs mounts (scans `/proc/mounts`). |
-| `ghfs refresh` | Re-fetch the cached repo list. |
+| `ghfs refresh` | Re-fetch the cached repo list and show added/removed repos. |
 | `ghfs info <path>` | Print repo metadata (URL, description, visibility, fork flag, default/effective branch) for the repo at `<path>` inside an active mount. |
 | `ghfs promote <path> [--branch B]` | Manually clone a repo into a local working copy (every branch fetched into `refs/heads/*`, `--branch` initially checked out). Works regardless of `[clone] trigger`. `<path>` is a path inside an active mount, e.g. `~/ghfs/<owner>/<repo>`. |
 | `ghfs branch <path> <B>` | Set which branch the mount surfaces under `<mount>/<owner>/<repo>/`. `<path>` is a path inside an active mount. Persistent; applies on next mount. Pass `--default` to clear. |
