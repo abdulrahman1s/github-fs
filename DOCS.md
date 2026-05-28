@@ -336,12 +336,13 @@ the configured trigger — useful for pre-staging a repo (e.g. so you can
 the cache.
 
 The clone is a regular non-bare git repository. Every branch is
-fetched into `refs/heads/*`; the `--branch` argument (or the repo's
+fetched into `refs/heads/*`, `origin` is configured, and local branches
+track `origin/<branch>`; the `--branch` argument (or the repo's
 effective default) is the one initially checked out. Once the clone
-exists, ghfs treats the working tree as the user's — switching
-branches (`git checkout dev`), committing, or making local edits is
-yours to manage. A repeat `ghfs promote` against an existing clone is
-a no-op and will **not** touch the working tree.
+exists, ghfs treats the working tree as the user's — switching branches
+(`git checkout dev`), committing, pushing, or making local edits is
+yours to manage. A repeat `ghfs promote` against an existing clone is a
+no-op and will **not** touch the working tree.
 
 `ghfs promote` requires a path inside an active ghfs FUSE mount. The
 owner and repo are read from the first two path components after the
@@ -394,6 +395,9 @@ Resolution rules:
 - depth — `[clone] fetch_depth = N` (or `GHFS_CLONE_FETCH_DEPTH`) caps
   each fetched branch at N commits. Useful for huge monorepos when you
   only need current contents. Unset = full history.
+- URL protocol — `[clone] url_protocol` (or `GHFS_CLONE_URL_PROTOCOL`)
+  controls the persisted `origin` URL for future user-run Git commands:
+  `https` (default) or `ssh`.
 
 `promote` always creates the clone even when `[clone] trigger =
 "never"`. It does *not* mutate the trigger config — but any live mount
@@ -521,8 +525,9 @@ background poll.
     no override is set.
 - Branches other than the effective one are not surfaced via the mount.
   After a `ghfs promote`, every branch is fetched into the local clone
-  at `<cache>/clones/<owner>/<repo>/`, so `cd` into that dir and `git
-  checkout <other>` to switch what the mount serves.
+  at `<cache>/clones/<owner>/<repo>/` with `origin` configured, so `cd`
+  into that dir and `git checkout <other>` to switch what the mount
+  serves.
 - Tags are not surfaced via the mount; check out a tag inside the
   materialized clone if you need one.
 
@@ -603,6 +608,7 @@ visibility     = "all"
 [clone]
 trigger     = "never"   # "never" (default) | "on_list" | "on_read" | "on_access"
 # fetch_depth = 1       # shallow-clone depth; unset / 0 = full history
+url_protocol = "https"  # origin URL protocol: "https" (default) | "ssh"
 ```
 
 The parser rejects unknown keys to catch typos early. `chmod 0600
@@ -650,11 +656,13 @@ in two ways:
    only adds a faster, real-filesystem source once it exists.
 
 The clone is a regular non-bare git repository with **every branch
-fetched** into `refs/heads/*`. The branch initially checked out is the
-effective branch at clone time; `cd` into the dir and `git checkout
-<other>` to switch what the mount serves. ghfs never re-checks-out for
-you, so your working-tree state (dirty files, in-progress commits) is
-yours to manage.
+fetched** into `refs/heads/*`. It also has an `origin` remote and local
+branches configured to track `origin/<branch>`, so normal `git pull`
+and `git push` work from inside the materialized repo. The branch
+initially checked out is the effective branch at clone time; `cd` into
+the dir and `git checkout <other>` to switch what the mount serves.
+ghfs never re-checks-out for you, so your working-tree state (dirty
+files, in-progress commits) is yours to manage.
 
 The switch between virtual and passthrough is a per-call dispatch
 decision; the FUSE inode for the repo (and every descendant) is
@@ -673,6 +681,13 @@ no inode flip to invalidate the shell's open `cwd`.
 cloning a giant monorepo just to browse current contents. Unset (or
 `0`) fetches full history. Env: `GHFS_CLONE_FETCH_DEPTH`.
 
+`url_protocol = "https"` (default) leaves `origin.url` as
+`https://github.com/<owner>/<repo>.git`. `url_protocol = "ssh"` writes
+`origin.url` as `git@github.com:<owner>/<repo>.git`, useful if your
+normal Git workflow pushes over SSH. The materialization fetch itself
+still uses HTTPS token auth so ghfs can clone with the configured
+GitHub token. Env: `GHFS_CLONE_URL_PROTOCOL`.
+
 `on_list` and `on_read` fire *after* the kernel has already walked into
 the repo dir, so within the same session the triggering op completes
 via the virtual path; the *next* access (within the 1-second repo
@@ -688,16 +703,19 @@ in this category — it requires a remount; see the
 [subcommand](#ghfs-branch).)
 
 Each clone is **non-bare** and **fetches every branch**: a single
-`git init` + `fetch +refs/heads/*:refs/heads/*` populates all branches
-into the same working tree's object DB. The initial checkout is the
-branch passed to `ensure_clone` (the repo's effective branch at
-trigger / promote time). There is no automatic re-fetch within a mount
-session — to advance to new commits, `cd` into the clone and `git
-pull` (or `git fetch && git checkout <other>` to switch branches).
+`git init` + fetch populates both local branches under `refs/heads/*`
+and remote-tracking branches under `refs/remotes/origin/*`. The initial
+checkout is the branch passed to `ensure_clone` (the repo's effective
+branch at trigger / promote time). There is no automatic re-fetch
+within a mount session — to advance to new commits, `cd` into the clone
+and `git pull` (or `git fetch && git checkout <other>` to switch
+branches).
 
 The token configured for the mount is passed to libgit2 via HTTP basic
-auth (`username = x-access-token`), which works for both classic and
-fine-grained PATs.
+auth (`username = x-access-token`) for the initial materialization
+fetch, which works for both classic and fine-grained PATs. Future
+user-run Git commands use the persisted `origin` URL selected by
+`url_protocol`.
 
 The disk layout under the cache:
 
@@ -739,6 +757,7 @@ Notes:
 | `GHFS_VISIBILITY` | Override `visibility`. Accepts `all`, `public` (`public-only`), or `private` (`private-only`). |
 | `GHFS_CLONE_TRIGGER` | Override `[clone] trigger`. Accepts `never`/`off`/`disabled`, `on_list`/`on-list`/`list`, `on_read`/`on-read`/`read`, or `on_access`/`on-access`/`access`. |
 | `GHFS_CLONE_FETCH_DEPTH` | Override `[clone] fetch_depth`. Positive integer = shallow clone depth; `0` = full history (same as unset). |
+| `GHFS_CLONE_URL_PROTOCOL` | Override `[clone] url_protocol`. Accepts `https`/`http` (default) or `ssh`; controls the persisted `origin` URL in materialized clones. |
 | `RUST_LOG` | Standard `tracing` env var; lower precedence than `GHFS_LOG_LEVEL`. |
 
 ### CLI flags
@@ -760,7 +779,7 @@ Per-subcommand flags are listed under [Subcommands](#subcommands).
 | `~/.cache/ghfs/` | Default cache root (XDG, fallback `/tmp/ghfs-cache`). |
 | `~/.cache/ghfs/meta.db` | SQLite metadata DB. |
 | `~/.cache/ghfs/blobs/aa/<sha>` | Content-addressed blob store. |
-| `~/.cache/ghfs/clones/<owner>/<repo>/` | Non-bare libgit2 clone (one per repo) — only present when `[clone] trigger` is enabled or after `ghfs promote`. Holds every branch in `refs/heads/*` plus a working tree. |
+| `~/.cache/ghfs/clones/<owner>/<repo>/` | Non-bare libgit2 clone (one per repo) — only present when `[clone] trigger` is enabled or after `ghfs promote`. Holds every branch in `refs/heads/*`, `origin` tracking refs, and a working tree. |
 | `~/.cache/ghfs/mounts/<encoded-mountpath>.pid` | Pidfile per live mount, used by `ghfs refresh` to signal `SIGUSR1`. Removed on graceful shutdown; stale entries reaped by `ghfs refresh`. |
 
 ## Cache layout
@@ -792,13 +811,13 @@ holds 50k files). Writes are atomic via `NamedTempFile + persist`.
 When `[clone] trigger` is anything other than `"never"` (or when `ghfs
 promote` runs), ghfs keeps a non-bare libgit2 clone of each visited
 repo at `<cache_dir>/clones/<owner>/<repo>/`. Each clone is a regular
-git working tree with **every branch fetched** into `refs/heads/*` and
-the repo's effective branch initially checked out. After the first
-clone, ghfs never touches the working tree again — `git checkout`,
-local edits, in-progress commits are all yours. The clones are
-**rebuildable** in the same sense as the rest of the cache — delete
-the directory and the next access (with the trigger still on) will
-re-clone.
+git working tree with **every branch fetched** into `refs/heads/*`,
+`origin` configured, upstream tracking set, and the repo's effective
+branch initially checked out. After the first clone, ghfs never touches
+the working tree again — `git checkout`, local edits, in-progress
+commits are all yours. The clones are **rebuildable** in the same sense
+as the rest of the cache — delete the directory and the next access
+(with the trigger still on) will re-clone.
 
 `fetch_depth = N` makes the fetch shallow (libgit2's `--depth N`),
 which is useful for huge monorepos when you only need current

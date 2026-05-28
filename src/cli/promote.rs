@@ -71,8 +71,8 @@ pub async fn run(
         "promoting repo into local clone store"
     );
 
-    let store =
-        CloneStore::open(&clone_root, token).context("opening clone store under cache dir")?;
+    let store = CloneStore::open_with_url_protocol(&clone_root, token, cfg.clone.url_protocol)
+        .context("opening clone store under cache dir")?;
     let mut renderer = CliProgress::new();
     let path = store
         .ensure_clone(

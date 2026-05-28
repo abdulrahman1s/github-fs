@@ -6,21 +6,23 @@
 //! any libgit2 step fails, the caller falls back to the GitHub API path.
 //!
 //! Layout on disk: `<cache_dir>/clones/<owner>/<repo>/` (non-bare). One clone
-//! per repo, with every branch fetched into `refs/heads/*`. Whichever branch
-//! is requested first is checked out; the user can `git checkout` to switch.
+//! per repo, with every branch fetched into `refs/heads/*`, `origin`
+//! configured, and upstream tracking set. Whichever branch is requested first
+//! is checked out; the user can `git checkout` to switch.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use git2::{Cred, FetchOptions, ObjectType, Oid, RemoteCallbacks, Repository};
+use git2::{BranchType, Cred, FetchOptions, ObjectType, Oid, RemoteCallbacks, Repository};
 
 use crate::cache::CacheError;
-use crate::config::token::Token;
+use crate::config::{CloneUrlProtocol, token::Token};
 use crate::github::{Tree, TreeEntry, TreeEntryKind};
 
 const GITHUB_HTTPS_BASE: &str = "https://github.com";
+const GITHUB_SSH_HOST: &str = "github.com";
 
 type RepoKey = (String, String);
 type RepoLocks = Mutex<HashMap<RepoKey, Arc<Mutex<()>>>>;
@@ -57,6 +59,7 @@ pub fn no_progress() -> impl FnMut(CloneProgress) {
 pub struct CloneStore {
     root: PathBuf,
     token: Token,
+    url_protocol: CloneUrlProtocol,
     /// One Mutex per (owner, repo) — serializes the initial clone of the
     /// same repo. Read-only ops (`find_blob`, `find_commit`, tree walks)
     /// bypass this lock entirely.
@@ -65,11 +68,20 @@ pub struct CloneStore {
 
 impl CloneStore {
     pub fn open<P: AsRef<Path>>(root: P, token: Token) -> Result<Self, CacheError> {
+        Self::open_with_url_protocol(root, token, CloneUrlProtocol::default())
+    }
+
+    pub fn open_with_url_protocol<P: AsRef<Path>>(
+        root: P,
+        token: Token,
+        url_protocol: CloneUrlProtocol,
+    ) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             root,
             token,
+            url_protocol,
             locks: Mutex::new(HashMap::new()),
         })
     }
@@ -116,8 +128,9 @@ impl CloneStore {
     /// branches fetched and `initial_branch` checked out in the working tree.
     /// Returns the path to the clone (the working-tree root).
     ///
-    /// **First call:** `git init` + fetch `+refs/heads/*:refs/heads/*` from
-    /// `remote_base/<owner>/<repo>.git`, then check out `initial_branch`.
+    /// **First call:** `git init` + fetch all branches from
+    /// `remote_base/<owner>/<repo>.git`, configure `origin`, then check out
+    /// `initial_branch`.
     /// `fetch_depth = Some(n)` makes the fetch shallow (`--depth n`); `None`
     /// fetches full history.
     ///
@@ -125,9 +138,11 @@ impl CloneStore {
     /// Switching branches inside the clone is their responsibility (`git
     /// checkout`); ghfs will not clobber dirty working-tree state.
     ///
-    /// Auth uses HTTP basic with username `x-access-token`, which works for
-    /// both classic and fine-grained GitHub PATs. Concurrent calls for the
-    /// same repo serialize on the per-`(owner, repo)` lock.
+    /// The materialization fetch uses HTTP basic with username
+    /// `x-access-token`, which works for both classic and fine-grained GitHub
+    /// PATs. The persisted `origin` URL follows the configured URL protocol.
+    /// Concurrent calls for the same repo serialize on the per-`(owner, repo)`
+    /// lock.
     pub fn ensure_clone(
         &self,
         owner: &str,
@@ -156,7 +171,8 @@ impl CloneStore {
         }
 
         let repo_handle = Repository::init(&target)?;
-        let url = format!("{remote_base}/{owner}/{repo}.git");
+        let fetch_url = format!("{remote_base}/{owner}/{repo}.git");
+        let origin_url = persisted_origin_url(self.url_protocol, owner, repo, &fetch_url);
         let token = self.token.clone();
         // RefCell so both libgit2 callbacks (transfer_progress here,
         // checkout progress below) can mutably borrow the same FnMut without
@@ -188,14 +204,20 @@ impl CloneStore {
                 fo.depth(d as i32);
             }
 
-            // Anonymous remote so we don't persist a stale config we'd never
-            // touch again. The refspec mirrors `git clone --no-single-branch`:
-            // every server-side branch becomes a local branch under
-            // `refs/heads/*`, so a future `git checkout <any>` just works.
-            let mut remote = repo_handle.remote_anonymous(&url)?;
+            // Fetch over the authenticated URL, then leave a normal `origin`
+            // behind for the user's future git commands. The extra
+            // remote-tracking refspec is what lets plain `git push` and
+            // `git pull` infer an upstream branch.
+            let mut remote = repo_handle.remote("origin", &fetch_url)?;
             let all_refs = "+refs/heads/*:refs/heads/*";
-            remote.fetch(&[all_refs], Some(&mut fo), None)?;
+            let tracking_refs = "+refs/heads/*:refs/remotes/origin/*";
+            remote.fetch(&[all_refs, tracking_refs], Some(&mut fo), None)?;
         }
+
+        if origin_url != fetch_url {
+            repo_handle.remote_set_url("origin", &origin_url)?;
+        }
+        configure_branch_upstreams(&repo_handle)?;
 
         // Set HEAD to the requested branch and materialize its tree in the
         // working directory. `set_head` + `checkout_head` is the libgit2
@@ -340,6 +362,34 @@ fn walk_tree(
     Ok(())
 }
 
+fn persisted_origin_url(
+    protocol: CloneUrlProtocol,
+    owner: &str,
+    repo: &str,
+    fetch_url: &str,
+) -> String {
+    match protocol {
+        CloneUrlProtocol::Https => fetch_url.to_owned(),
+        CloneUrlProtocol::Ssh => format!("git@{GITHUB_SSH_HOST}:{owner}/{repo}.git"),
+    }
+}
+
+fn configure_branch_upstreams(repo: &Repository) -> Result<(), git2::Error> {
+    for branch in repo.branches(Some(BranchType::Local))? {
+        let (mut branch, _) = branch?;
+        let Some(name) = branch.name()?.map(str::to_owned) else {
+            continue;
+        };
+
+        let upstream = format!("origin/{name}");
+        if repo.find_branch(&upstream, BranchType::Remote).is_ok() {
+            branch.set_upstream(Some(&upstream))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Default remote base used when cloning. Exposed so tests can point at a
 /// local bare-repo `file://` URL.
 pub fn default_remote_base() -> String {
@@ -409,6 +459,49 @@ mod tests {
 
         let tip = store.branch_tip("acme", "widgets", "main").unwrap();
         assert_eq!(tip, expected_commit);
+    }
+
+    #[test]
+    fn ensure_clone_configures_origin_remote_and_upstream() {
+        let (_remote, base, _expected_commit) = setup_remote();
+        let store_dir = tempdir().unwrap();
+        let store = CloneStore::open(store_dir.path(), Token::new("ignored")).unwrap();
+        let target = store
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
+            .unwrap();
+
+        let opened = Repository::open(&target).unwrap();
+        let origin = opened.find_remote("origin").unwrap();
+        let expected_url = format!("{base}/acme/widgets.git");
+        assert_eq!(origin.url(), Some(expected_url.as_str()));
+        assert_eq!(origin.pushurl(), None);
+
+        let branch = opened.find_branch("main", BranchType::Local).unwrap();
+        let upstream = branch.upstream().unwrap();
+        assert_eq!(upstream.get().name(), Some("refs/remotes/origin/main"));
+    }
+
+    #[test]
+    fn ensure_clone_can_persist_ssh_origin_url() {
+        let (_remote, base, _expected_commit) = setup_remote();
+        let store_dir = tempdir().unwrap();
+        let store = CloneStore::open_with_url_protocol(
+            store_dir.path(),
+            Token::new("ignored"),
+            CloneUrlProtocol::Ssh,
+        )
+        .unwrap();
+        let target = store
+            .ensure_clone("acme", "widgets", "main", &base, None, &mut no_progress())
+            .unwrap();
+
+        let opened = Repository::open(&target).unwrap();
+        let origin = opened.find_remote("origin").unwrap();
+        assert_eq!(origin.url(), Some("git@github.com:acme/widgets.git"));
+
+        let branch = opened.find_branch("main", BranchType::Local).unwrap();
+        let upstream = branch.upstream().unwrap();
+        assert_eq!(upstream.get().name(), Some("refs/remotes/origin/main"));
     }
 
     #[test]

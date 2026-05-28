@@ -184,11 +184,35 @@ impl CloneTrigger {
     }
 }
 
+/// Protocol used for the persisted `origin` URL in materialized clones.
+///
+/// ghfs still performs the initial libgit2 fetch over HTTPS with the
+/// configured token; this controls what users see afterwards when they run
+/// normal `git fetch`, `git pull`, or `git push` in the clone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneUrlProtocol {
+    #[default]
+    Https,
+    Ssh,
+}
+
+impl CloneUrlProtocol {
+    fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "https" | "http" => Some(Self::Https),
+            "ssh" => Some(Self::Ssh),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CloneConfigFile {
     trigger: Option<String>,
     fetch_depth: Option<u32>,
+    url_protocol: Option<String>,
 }
 
 /// Resolved clone settings.
@@ -201,6 +225,7 @@ pub struct CloneConfig {
     /// just to browse current contents, since `fetch +refs/heads/*` would
     /// otherwise pull every branch's full history.
     pub fetch_depth: Option<u32>,
+    pub url_protocol: CloneUrlProtocol,
 }
 
 #[derive(Debug, Error)]
@@ -374,6 +399,17 @@ fn resolve(file: ConfigFile, env: &HashMap<String, String>, file_present: bool) 
         .or_else(|| file.clone.as_ref().and_then(|c| c.fetch_depth))
         .filter(|d| *d > 0);
 
+    let clone_url_protocol = env
+        .get("GHFS_CLONE_URL_PROTOCOL")
+        .and_then(|s| CloneUrlProtocol::from_str_opt(s))
+        .or_else(|| {
+            file.clone
+                .as_ref()
+                .and_then(|c| c.url_protocol.as_deref())
+                .and_then(CloneUrlProtocol::from_str_opt)
+        })
+        .unwrap_or_default();
+
     Config {
         token,
         mount_path,
@@ -387,6 +423,7 @@ fn resolve(file: ConfigFile, env: &HashMap<String, String>, file_present: bool) 
         clone: CloneConfig {
             trigger: clone_trigger,
             fetch_depth,
+            url_protocol: clone_url_protocol,
         },
         config_file_present: file_present,
     }
@@ -821,6 +858,59 @@ fetch_depth = 25"#,
         .unwrap();
         let cfg = resolve(cf, &env(&[("GHFS_CLONE_FETCH_DEPTH", "deep")]), true);
         assert_eq!(cfg.clone.fetch_depth, Some(25));
+    }
+
+    #[test]
+    fn clone_url_protocol_defaults_to_https() {
+        let cfg = resolve(ConfigFile::default(), &HashMap::new(), false);
+        assert_eq!(cfg.clone.url_protocol, CloneUrlProtocol::Https);
+    }
+
+    #[test]
+    fn clone_url_protocol_parses_from_toml() {
+        for (raw, expected) in [
+            (
+                r#"[clone]
+url_protocol = "https""#,
+                CloneUrlProtocol::Https,
+            ),
+            (
+                r#"[clone]
+url_protocol = "http""#,
+                CloneUrlProtocol::Https,
+            ),
+            (
+                r#"[clone]
+url_protocol = "ssh""#,
+                CloneUrlProtocol::Ssh,
+            ),
+        ] {
+            let cf: ConfigFile = toml::from_str(raw).unwrap();
+            let cfg = resolve(cf, &HashMap::new(), true);
+            assert_eq!(cfg.clone.url_protocol, expected, "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn clone_url_protocol_env_overrides_file() {
+        let cf: ConfigFile = toml::from_str(
+            r#"[clone]
+url_protocol = "https""#,
+        )
+        .unwrap();
+        let cfg = resolve(cf, &env(&[("GHFS_CLONE_URL_PROTOCOL", "ssh")]), true);
+        assert_eq!(cfg.clone.url_protocol, CloneUrlProtocol::Ssh);
+    }
+
+    #[test]
+    fn clone_url_protocol_unparseable_env_falls_back_to_file() {
+        let cf: ConfigFile = toml::from_str(
+            r#"[clone]
+url_protocol = "ssh""#,
+        )
+        .unwrap();
+        let cfg = resolve(cf, &env(&[("GHFS_CLONE_URL_PROTOCOL", "ftp")]), true);
+        assert_eq!(cfg.clone.url_protocol, CloneUrlProtocol::Ssh);
     }
 
     #[test]

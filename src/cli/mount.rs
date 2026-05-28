@@ -68,7 +68,8 @@ pub fn run(
     // routes ops to those clones on lookup (passthrough) so the mount and
     // the CLI interoperate regardless of trigger.
     let clone_store = Some(Arc::new(
-        CloneStore::open(&clone_root, token.clone()).context("opening clone store")?,
+        CloneStore::open_with_url_protocol(&clone_root, token.clone(), cfg.clone.url_protocol)
+            .context("opening clone store")?,
     ));
     let client = Arc::new(GithubClient::new(token).context("building github client")?);
     let filter =

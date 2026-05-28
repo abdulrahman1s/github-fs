@@ -121,3 +121,13 @@ trigger = "never"
 # Env: GHFS_CLONE_FETCH_DEPTH
 # Default: unset (full clone).
 # fetch_depth = 1
+
+# Protocol for the persisted `origin` URL in materialized clones.
+# ghfs still performs the initial clone fetch over HTTPS with the configured
+# token; this controls what later user-run `git fetch`, `git pull`, and
+# `git push` commands use from inside the working tree.
+#   "https" (default) — origin.url = https://github.com/<owner>/<repo>.git
+#   "ssh"             — origin.url = git@github.com:<owner>/<repo>.git
+# Env: GHFS_CLONE_URL_PROTOCOL — accepts https/http or ssh.
+# Default: "https".
+# url_protocol = "https"

@@ -79,8 +79,8 @@ just becomes writable, backed by a real git checkout.
   mount.
 - **One branch per repo dir** (the GitHub default by default). Swap
   per-repo with `ghfs branch <path> <other>`. Promoted repos clone
-  every branch into `refs/heads/*` — `cd` in and `git checkout <other>`
-  to switch what the mount serves.
+  every branch, configure `origin`, and track upstream branches — `cd`
+  in and `git checkout <other>` to switch what the mount serves.
 - **Filter what shows up.** Yourself, everything visible, or an owner
   allowlist. Hide forks; show only private or only public. See
   [DOCS.md](DOCS.md#filtering-which-repos-appear).
@@ -177,7 +177,7 @@ Token scopes: `repo` for private repos, none for public ones.
 | `ghfs status` | List active ghfs mounts (scans `/proc/mounts`). |
 | `ghfs refresh` | Re-fetch the cached repo list and show added/removed repos. |
 | `ghfs info <path>` | Print repo metadata (URL, description, visibility, fork flag, default/effective branch) for the repo at `<path>` inside an active mount. |
-| `ghfs promote <path> [--branch B]` | Manually clone a repo into a local working copy (every branch fetched into `refs/heads/*`, `--branch` initially checked out). Works regardless of `[clone] trigger`. `<path>` is a path inside an active mount, e.g. `~/ghfs/<owner>/<repo>`. |
+| `ghfs promote <path> [--branch B]` | Manually clone a repo into a local working copy (`origin` configured, every branch fetched, `--branch` initially checked out). Works regardless of `[clone] trigger`. `<path>` is a path inside an active mount, e.g. `~/ghfs/<owner>/<repo>`. |
 | `ghfs branch <path> <B>` | Set which branch the mount surfaces under `<mount>/<owner>/<repo>/`. `<path>` is a path inside an active mount. Persistent; applies on next mount. Pass `--default` to clear. |
 | `ghfs completions <shell>` | Print a shell-completion script (`bash`, `zsh`, `fish`, `elvish`, `powershell`) to stdout. Redirect into the location your shell expects. |
 
