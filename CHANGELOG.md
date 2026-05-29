@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0](https://github.com/abdulrahman1s/github-fs/compare/v0.5.1...v0.6.0) (2026-05-29)
+
+
+### Features
+
+* **cli:** show repo changes during refresh ([45c8fd3](https://github.com/abdulrahman1s/github-fs/commit/45c8fd349ce10653e93d161ea4580c4cbe7c8ae2))
+* **clone:** configure origin remotes for materialized repos ([8f95a7d](https://github.com/abdulrahman1s/github-fs/commit/8f95a7df3c6ee3d13dd1955333b9ad0156cb0102))
+* **fs:** support hard links inside materialized worktrees ([9aa5f91](https://github.com/abdulrahman1s/github-fs/commit/9aa5f9114aac0ceabe47b28db912d4c8e67f3e6c))
+
 ## [0.5.1](https://github.com/abdulrahman1s/github-fs/compare/v0.5.0...v0.5.1) (2026-05-27)
 
 
