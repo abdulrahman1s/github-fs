@@ -2956,6 +2956,69 @@ impl Filesystem for Ghfs {
         }
     }
 
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let Some(newname_str) = newname.to_str() else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let Some((src_disk, repo_src, branch_src, _)) = self.passthrough_ctx(ino) else {
+            reply.error(libc::EROFS);
+            return;
+        };
+        let Some((newparent_disk, repo_dst, branch_dst, parent_rel)) =
+            self.passthrough_ctx(newparent)
+        else {
+            reply.error(libc::EROFS);
+            return;
+        };
+        // Each (repo, branch) materializes to its own on-disk worktree, so
+        // a hard link across them would cross underlying inode spaces.
+        // POSIX answers that with `EXDEV` — same convention used by `rename`.
+        if repo_src.repo_id != repo_dst.repo_id || branch_src != branch_dst {
+            reply.error(libc::EXDEV);
+            return;
+        }
+        let dst = newparent_disk.join(newname_str);
+        debug!(src = %src_disk.display(), dst = %dst.display(), "link");
+
+        if let Err(e) = std::fs::hard_link(&src_disk, &dst) {
+            error!(?e, src = %src_disk.display(), dst = %dst.display(), "link failed");
+            reply.error(io_to_errno(&e));
+            return;
+        }
+        let metadata = match std::fs::symlink_metadata(&dst) {
+            Ok(m) => m,
+            Err(e) => {
+                reply.error(io_to_errno(&e));
+                return;
+            }
+        };
+        // The new link gets its own FUSE ino keyed by (newparent, newname).
+        // st_nlink reflects the real disk linkage (>=2) via the metadata
+        // we just stat'd, but st_ino reported to userspace diverges from
+        // the source's ino — tools that detect hard links by comparing
+        // st_ino (du, tar -l, rsync -H) won't deduplicate within the
+        // mount. Acceptable trade-off: InodeTable's reverse link is 1:1
+        // ino → (parent, name), and rename relies on that uniqueness.
+        let (new_ino, _kind) = self.passthrough_allocate(
+            newparent,
+            newname_str,
+            &repo_dst,
+            &branch_dst,
+            &parent_rel,
+            &metadata,
+        );
+        let attr = build_attr_from_metadata(new_ino, &metadata, self.uid, self.gid);
+        reply.entry(&ZERO_TTL, &attr, 0);
+    }
+
     fn symlink(
         &mut self,
         _req: &Request<'_>,
@@ -3233,6 +3296,7 @@ mod passthrough_tests {
     use crate::config::token::Token;
     use crate::fs::inode::RepoRef;
     use crate::github::{GithubClient, RepoFilter};
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     /// Construct a `Ghfs` wired against on-disk temp dirs with no real
@@ -3625,5 +3689,140 @@ mod passthrough_tests {
             .expect("lookup child")
             .expect("present");
         assert!(matches!(*grand.1, InodeKind::File { .. }));
+    }
+
+    #[test]
+    fn hard_link_within_worktree_creates_second_name_for_same_inode() {
+        // Exercises the primitives `fn link` chains: resolve source +
+        // dest via `passthrough_ctx`, verify same (repo, branch), call
+        // hard_link on disk, allocate a new FUSE ino for the new name.
+        // After the link, both names reach the same underlying disk
+        // inode (st_nlink == 2) and both resolve through
+        // `passthrough_disk_path` to a path that stats to that inode.
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, _rt) = build_fs(temp.path());
+        let repo = rref();
+        let wt = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
+        std::fs::write(wt.join("original"), b"payload").unwrap();
+
+        let (repo_ino, _) =
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "widgets", || InodeKind::Repo {
+                    repo: repo.clone(),
+                    branch: "main".into(),
+                });
+
+        let src_meta = std::fs::symlink_metadata(wt.join("original")).unwrap();
+        let (src_ino, _) =
+            fs.passthrough_allocate(repo_ino, "original", &repo, "main", "", &src_meta);
+
+        // What `fn link` does, inlined: ctx for source + newparent agree
+        // on repo_id and branch, so no EXDEV; std::fs::hard_link
+        // succeeds; the new (parent, name) gets its own FUSE ino.
+        let (src_disk, repo_src, branch_src, _) = fs.passthrough_ctx(src_ino).expect("src ctx");
+        let (newparent_disk, repo_dst, branch_dst, parent_rel) =
+            fs.passthrough_ctx(repo_ino).expect("newparent ctx");
+        assert_eq!(repo_src.repo_id, repo_dst.repo_id);
+        assert_eq!(branch_src, branch_dst);
+
+        let dst = newparent_disk.join("alias");
+        std::fs::hard_link(&src_disk, &dst).expect("hard_link");
+        let dst_meta = std::fs::symlink_metadata(&dst).unwrap();
+        let (dst_ino, _) = fs.passthrough_allocate(
+            repo_ino,
+            "alias",
+            &repo_dst,
+            &branch_dst,
+            &parent_rel,
+            &dst_meta,
+        );
+
+        assert_ne!(
+            src_ino, dst_ino,
+            "the second name gets its own FUSE ino — InodeTable's reverse link is 1:1"
+        );
+        let src_after = std::fs::symlink_metadata(&src_disk).unwrap();
+        assert_eq!(src_after.nlink(), 2);
+        assert_eq!(dst_meta.nlink(), 2);
+        assert_eq!(
+            src_after.ino(),
+            dst_meta.ino(),
+            "same underlying disk inode"
+        );
+
+        // Both FUSE inos resolve through to disk paths that stat to the
+        // same underlying file — reads through either name see the same
+        // bytes.
+        let src_resolved = fs.passthrough_disk_path(src_ino).unwrap();
+        let dst_resolved = fs.passthrough_disk_path(dst_ino).unwrap();
+        assert_eq!(std::fs::read(&src_resolved).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&dst_resolved).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn hard_link_across_repos_is_detected_as_exdev() {
+        // Two repos materialize to two separate worktrees on disk, so a
+        // hard link across them would cross underlying inode spaces.
+        // `fn link` guards this by comparing (repo_id, branch) on the
+        // source vs. newparent ctx and returning EXDEV when they differ.
+        // This test pins the signal the guard depends on.
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, _rt) = build_fs(temp.path());
+        let repo_a = rref();
+        let repo_b = RepoRef {
+            repo_id: 99,
+            owner: "other".into(),
+            name: "thing".into(),
+        };
+        let wt_a = make_fake_clone(&temp.path().join("clones"), "acme", "widgets");
+        let wt_b = make_fake_clone(&temp.path().join("clones"), "other", "thing");
+        std::fs::write(wt_a.join("file"), b"a").unwrap();
+        std::fs::write(wt_b.join("placeholder"), b"b").unwrap();
+
+        let (repo_a_ino, _) =
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "widgets", || InodeKind::Repo {
+                    repo: repo_a.clone(),
+                    branch: "main".into(),
+                });
+        let (repo_b_ino, _) =
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "thing", || InodeKind::Repo {
+                    repo: repo_b.clone(),
+                    branch: "main".into(),
+                });
+        let src_meta = std::fs::symlink_metadata(wt_a.join("file")).unwrap();
+        let (src_ino, _) =
+            fs.passthrough_allocate(repo_a_ino, "file", &repo_a, "main", "", &src_meta);
+
+        let (_, repo_src, branch_src, _) = fs.passthrough_ctx(src_ino).expect("src ctx");
+        let (_, repo_dst, branch_dst, _) = fs.passthrough_ctx(repo_b_ino).expect("dst ctx");
+        // The discriminator `fn link` reaches for before doing any disk
+        // work — different repos report different repo_ids even when
+        // both are on the "main" branch.
+        assert!(repo_src.repo_id != repo_dst.repo_id || branch_src != branch_dst);
+    }
+
+    #[test]
+    fn hard_link_with_virtual_source_has_no_passthrough_ctx() {
+        // A repo with no materialized worktree → `passthrough_ctx` is
+        // None for every ino under it. `fn link` reads that as "no disk
+        // inode to link from" and returns EROFS. This test pins the
+        // None signal; the EROFS branch in `fn link` is straight-line
+        // code off it.
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, _rt) = build_fs(temp.path());
+        let virtual_repo = RepoRef {
+            repo_id: 7,
+            owner: "ghost".into(),
+            name: "norepo".into(),
+        };
+        let (virtual_ino, _) =
+            fs.inodes
+                .lookup_or_create(FUSE_ROOT_INO, "norepo", || InodeKind::Repo {
+                    repo: virtual_repo,
+                    branch: "main".into(),
+                });
+        assert!(fs.passthrough_ctx(virtual_ino).is_none());
     }
 }

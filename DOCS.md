@@ -556,7 +556,8 @@ modulo the branch-head ETag cache TTL.
 | `stat` times | Virtual mode: all set to the process start time (GitHub's tree API doesn't expose per-entry mtimes). Passthrough mode: real disk times. |
 | Sizes | Virtual mode: blob size from the tree response. Passthrough mode: real disk size. |
 | Reads | First `open` triggers one `GET /repos/:o/:r/git/blobs/:sha` if the blob isn't cached, then all `read` calls `pread` against the local blob file. With a materialized clone, reads come straight from the on-disk working tree (passthrough) and skip the blob cache entirely. |
-| Writes | `EROFS` everywhere by default. Inside a materialized repo, the following ops are forwarded to `std::fs` against the working tree: `create`, `write`, `mkdir`, `unlink`, `rmdir`, `rename`, `setattr` (chmod / truncate / utimes), `symlink`, `fsync`. Cross-repo rename returns `EXDEV`. |
+| Writes | `EROFS` everywhere by default. Inside a materialized repo, the following ops are forwarded to `std::fs` against the working tree: `create`, `write`, `mkdir`, `unlink`, `rmdir`, `rename`, `setattr` (chmod / truncate / utimes), `symlink`, `link`, `fsync`. Cross-repo / cross-branch `rename` or `link` returns `EXDEV`. |
+| Hard links | `link(2)` is supported when source and destination both sit inside the same materialized worktree (same repo and effective branch). Forwarded to `std::fs::hard_link`, so `st_nlink` reflects the real on-disk link count. Caveat: each name gets its own FUSE inode number, so userspace tools that detect hard links by comparing `st_ino` (`du`, `tar -l`, `rsync -H`) won't deduplicate within the mount. Linking across worktrees returns `EXDEV`; linking into or out of a virtual (un-materialized) path returns `EROFS`. |
 
 The FUSE layer enforces the read-only policy itself (returning `EROFS`
 from every write op unless the target ino sits under a materialized
@@ -984,7 +985,7 @@ GitHub errors are translated to errnos at the FUSE boundary by
 | 404 Not Found | `ENOENT` | Repo/branch/file doesn't exist (or you can't see it). |
 | Network failure, 5xx, decode failure | `EIO` | Transient. Retry. |
 | Write attempt outside a materialized repo | `EROFS` | Promote the repo first (`ghfs promote`), or work in the cache path directly. |
-| Cross-repo rename | `EXDEV` | Renames must stay inside a single materialized repo — different repos are different worktrees on disk. |
+| Cross-repo rename / hard link | `EXDEV` | Renames and `link(2)` must stay inside a single materialized repo+branch — different worktrees are separate on-disk inode spaces. |
 | Passthrough syscall failed (e.g. ENOSPC, EACCES on disk) | passthrough errno | Whatever the underlying `std::fs` op returned; ghfs forwards `raw_os_error()` unchanged. |
 | Wrong inode kind for op (e.g. `read` on a dir) | `EISDIR` / `ENOTDIR` / `EINVAL` | Logic error in caller — `ls` won't hit this. |
 

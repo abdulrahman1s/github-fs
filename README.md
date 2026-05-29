@@ -194,6 +194,11 @@ errno mapping, systemd auto-mount, caching internals, and development workflows.
   effective branch (override from `ghfs branch`, falling back to the
   GitHub default). Override changes take effect at the next mount.
 * **Symlinks** (`mode 120000`) are surfaced as real symlinks.
+* **Hard links.** `link(2)` works inside a single materialized repo+branch;
+  crossing worktrees returns `EXDEV`, linking into or out of a virtual
+  path returns `EROFS`. Each name gets its own FUSE inode number, so
+  `st_nlink` is accurate but `st_ino`-based dedup (`du`, `tar -l`,
+  `rsync -H`) doesn't recognize the link.
 * **Submodules** (`mode 160000`) show as empty directories; gitlinks
   aren't followed.
 * **Truncated trees** (>~100k entries or >7 MB) log a warning and may
